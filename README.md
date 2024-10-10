@@ -32,7 +32,7 @@
 </div>
 
 
-
+We have built a repo [**Awesome-Try-On-Models**](https://github.com/Zheng-Chong/Awesome-Try-On-Models) that focuses on image, video, and 3D-based try-on models published after 2023, aiming to provide insights into the latest technological trends. If you're interested, feel free to contribute or give it a 🌟 star!
 
 ## Updates
 - **`2024/08/13`**: We localize DensePose & SCHP to avoid certain environment issues.
