@@ -41,7 +41,7 @@ class CatVTONPipeline:
         if not skip_safety_check:
             self.feature_extractor = CLIPImageProcessor.from_pretrained(base_ckpt, subfolder="feature_extractor")
             self.safety_checker = StableDiffusionSafetyChecker.from_pretrained(base_ckpt, subfolder="safety_checker").to(device, dtype=weight_dtype)
-        self.unet = UNet2DConditionModel.from_pretrained(base_ckpt, subfolder="unet", revision="fp16").to(device, dtype=weight_dtype)
+        self.unet = UNet2DConditionModel.from_pretrained(base_ckpt, subfolder="unet").to(device, dtype=weight_dtype)
         init_adapter(self.unet, cross_attn_cls=SkipAttnProcessor)  # Skip Cross-Attention
         self.attn_modules = get_trainable_module(self.unet, "attention")
         self.auto_attn_ckpt_load(attn_ckpt, attn_ckpt_version)
