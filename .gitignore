@@ -12,4 +12,3 @@ densepose_
 playground.py
 output
 model/cloth_masker_segformer.py
-app_p2p.py
