@@ -118,21 +118,21 @@ def image_grid(imgs, rows, cols):
 
 
 args = parse_args()
-repo_path = snapshot_download(repo_id="zhengchong/CatVTON-MaskFree")
+repo_path = snapshot_download(repo_id=args.ip_resume_path)
 # Pipeline
 pipeline_p2p = CatVTONPix2PixPipeline(
-    base_ckpt="timbrooks/instruct-pix2pix",
+    base_ckpt=args.p2p_base_model_path,
     attn_ckpt=repo_path,
-    attn_ckpt_version="Mix-1024-60k",
+    attn_ckpt_version="mix-48k-1024",
     weight_dtype=init_weight_dtype(args.mixed_precision),
     use_tf32=args.allow_tf32,
     device='cuda'
 )
 
 # Pipeline
-repo_path = snapshot_download(repo_id="zhengchong/CatVTON")
+repo_path = snapshot_download(repo_id=args.ip_resume_path)  
 pipeline = CatVTONPipeline(
-    base_ckpt="Models/stable-diffusion-inpainting",
+    base_ckpt=args.ip_base_model_path,
     attn_ckpt=repo_path,
     attn_ckpt_version="mix",
     weight_dtype=init_weight_dtype(args.mixed_precision),
