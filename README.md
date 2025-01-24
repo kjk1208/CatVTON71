@@ -33,6 +33,7 @@
 
 
 ## Updates
+- **`2025/01/24`**: 🥳 CatVTON has been accepted to [**ICLR 2025**]!
 - **`2024/12/20`**: 😄 Code for gradio app of [**CatVTON-FLUX**] has been released! It is not a stable version, but it is a good start!
 - **`2024/12/19`**: [**CatVTON-FLUX**](https://huggingface.co/spaces/zhengchong/CatVTON) has been released! It is a extremely lightweight LoRA (only 37.4M checkpints) for [FLUX.1-Fill-dev](https://huggingface.co/black-forest-labs/FLUX.1-Fill-dev), the lora weights are available in **[huggingface repo](https://huggingface.co/zhengchong/CatVTON/tree/main/flux-lora)**, code will be released soon!
 - **`2024/11/26`**: Our **unified vision-based model for image and video try-on** will be released soon, bringing a brand-new virtual try-on experience! While our demo page will be temporarily taken offline, [**the demo on HuggingFace Space**](https://huggingface.co/spaces/zhengchong/CatVTON) will remain available for use !
