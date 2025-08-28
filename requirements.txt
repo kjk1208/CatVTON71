@@ -1,22 +1,37 @@
+# ---- Core PyTorch stack (CUDA 빌드에 맞춰 우선 설치) ----
 torch==2.4.0
-torchvision==0.19.0 
-accelerate==0.31.0
-git+https://github.com/huggingface/diffusers.git
-matplotlib==3.9.1
+torchvision==0.19.0
+
+# ---- HF / Diffusion stack ----
+diffusers==0.35.1
+transformers==4.55.4
+accelerate==1.10.1
+huggingface_hub>=0.25.2
+safetensors>=0.4.3
+packaging>=23.2
+
+# ---- Image / Science utils ----
 numpy==1.26.3
-opencv_python==4.10.0.84
-pillow==10.3.0
-PyYAML==6.0.1
 scipy==1.13.1
-setuptools==51.0.0
+pillow==10.3.0
+opencv_python==4.10.0.84
 scikit-image==0.24.0
+matplotlib==3.9.1
 tqdm==4.66.4
-transformers==4.46.3
+
+# ---- Data / COCO / misc ----
+pycocotools==2.0.8
 fvcore==0.1.5.post20221221
 cloudpickle==3.0.0
 omegaconf==2.3.0
-pycocotools==2.0.8
+PyYAML==6.0.1
 av==12.3.0
+
+# ---- Optional / UI ----
 gradio==4.41.0
-peft==0.17.0
-huggingface_hub>=0.34.0,<0.45
+
+# ---- Optional: 빠른 다운로드(권장) ----
+hf_transfer>=0.1.6
+
+protobuf==4.25.3
+sentencepiece>=0.1.99

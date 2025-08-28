@@ -123,36 +123,20 @@ class PairListDataset(Dataset):
 # ------------------------------------------------------------
 
 def load_sd3_components(model_id: str, device, dtype, token: str = None, revision: str = None):
-    """
-    SD3/SD3.5를 허브에서 받아올 때 간혹 diffusers의 from_pretrained(token=...)
-    경로에서 403이 나는 환경이 있어, 허브의 snapshot_download로 먼저 로컬 캐시에
-    내려받고(토큰 확실히 적용), 그 로컬 디렉토리에서 파이프라인을 로드한다.
-    """
-    # 1) 권한/토큰 디버그(선택)
-    print(f"[HF] token prefix: {(token or '')[:8]}")
-    try:
-        who = HfApi(token=token).whoami()
-        print(f"[HF] whoami: {who.get('name') or who.get('email')}")
-    except Exception as e:
-        print("[HF] whoami failed:", e)
-
-    # 2) 먼저 파일을 로컬로 다운로드 (토큰 강제 적용)
-    #    allow_patterns으로 최소 파일만 받아도 되지만,
-    #    SD3.5는 추가 가중치가 필요할 수 있어 기본값(None)로 둔다.
+    # 1) 로컬 캐시에 먼저 다운로드(토큰 명확 적용)
     local_dir = snapshot_download(
         repo_id=model_id,
         token=token,
         revision=revision,
         resume_download=True,
-        local_files_only=False,   # 실제 다운로드
+        local_files_only=False,
     )
-    print(f"[HF] snapshot at: {local_dir}")
 
-    # 3) 로컬 디렉토리에서 파이프라인 로드(여기서는 토큰 불필요)
+    # 2) 로컬 디렉토리에서 파이프라인 로드
     pipe = StableDiffusion3Pipeline.from_pretrained(
         local_dir,
         torch_dtype=dtype,
-        local_files_only=True,    # 반드시 로컬에서만 읽기
+        local_files_only=True,
         use_safetensors=True,
     ).to(device)
 
@@ -233,31 +217,42 @@ class CatVTON_SD3_Trainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.float16 if cfg.mixed_precision == "fp16" and self.device.type == "cuda" else torch.float32
 
-        # Resolve token in the caller scope (env -> cfg.hf_token)
+        # Token
         env_token = (os.environ.get("HUGGINGFACE_TOKEN")
                      or os.environ.get("HUGGINGFACE_HUB_TOKEN")
                      or os.environ.get("HF_TOKEN"))
         token = cfg.hf_token or env_token
         if token is None:
             print("[warn] No HF token found. If the repo is gated, set HUGGINGFACE_TOKEN or pass --hf_token.")
-        # Debug: show token prefix and whoami (safe)
-        print(f"[HF] token prefix: {(token or '')[:8]}")
-        try:
-            who = HfApi(token=token).whoami()
-            print(f"[HF] whoami: {who.get('name') or who.get('email')}")
-        except Exception as e:
-            print("[HF] whoami failed:", e)
 
+        # Load SD3.5
         self.vae, self.transformer, self.encode_prompt, self.scheduler = load_sd3_components(
             cfg.sd3_model, self.device, self.dtype, token=token
         )
+        # 스케줄러 sigma를 아예 모델 dtype/디바이스로 맞춤
+        self.sigmas = self.scheduler.sigmas.to(device=self.device, dtype=self.dtype)
 
+        # (메모리 절약 옵션) gradient checkpointing / xFormers
+        try:
+            self.transformer.enable_gradient_checkpointing()
+            print("[mem] gradient checkpointing ON")
+        except Exception as e:
+            print("[mem] gradient checkpointing not available:", e)
+        try:
+            self.transformer.enable_xformers_memory_efficient_attention()
+            print("[mem] xFormers attention ON")
+        except Exception as e:
+            print("[mem] xFormers not available:", e)
+
+        # Projector
         self.projector = ConcatProjector(in_ch=33, out_ch=16).to(self.device, dtype=self.dtype)
 
+        # Freeze except attention
         trainable_tf = freeze_all_but_attn_sd3(self.transformer)
         proj_params = sum(p.numel() for p in self.projector.parameters())
         print(f"Trainable params: transformer-attn={trainable_tf/1e6:.2f}M, projector={proj_params/1e6:.2f}M")
 
+        # Data
         self.dataset = PairListDataset(
             cfg.list_file, size_hw=(cfg.size_h, cfg.size_w), mask_based=cfg.mask_based
         )
@@ -266,6 +261,18 @@ class CatVTON_SD3_Trainer:
             num_workers=cfg.num_workers, pin_memory=True, drop_last=True
         )
 
+        # Decide GradScaler usage: only if ALL trainable params are FP32
+        trainable_params = []
+        for p in self.transformer.parameters():
+            if p.requires_grad:
+                trainable_params.append(p)
+        trainable_params += list(self.projector.parameters())
+
+        self.use_scaler = (self.dtype == torch.float16) and all(p.dtype == torch.float32 for p in trainable_params)
+        print(f"[amp] use_scaler={self.use_scaler} "
+              f"(has_fp16_trainable={any(p.dtype == torch.float16 for p in trainable_params)})")
+
+        # Optimizer
         optim_params = itertools.chain(
             (p for p in self.transformer.parameters() if p.requires_grad),
             self.projector.parameters()
@@ -274,12 +281,27 @@ class CatVTON_SD3_Trainer:
         os.makedirs(cfg.output_dir, exist_ok=True)
 
     def _encode_prompts(self, bsz: int):
-        pe, _, ppe, _ = self.encode_prompt(
-            prompt=[""] * bsz,
-            device=self.device,
-            num_images_per_prompt=1,
-            do_classifier_free_guidance=False,
-        )
+        """
+        SD3/3.5는 T5/CLIP-L/CLIP-G 3개 텍스트 인코더를 사용.
+        텍스트 조건을 쓰지 않으므로 공백 프롬프트를 모두 전달.
+        """
+        empties = [""] * bsz
+        try:
+            pe, _, ppe, _ = self.encode_prompt(
+                prompt=empties,
+                prompt_2=empties,
+                prompt_3=empties,
+                device=self.device,
+                num_images_per_prompt=1,
+                do_classifier_free_guidance=False,
+            )
+        except TypeError:
+            pe, _, ppe, _ = self.encode_prompt(
+                prompt=empties,
+                device=self.device,
+                num_images_per_prompt=1,
+                do_classifier_free_guidance=False,
+            )
         return pe.to(self.dtype), ppe.to(self.dtype)
 
     def step(self, batch, global_step: int):
@@ -290,28 +312,34 @@ class CatVTON_SD3_Trainer:
         m_concat = batch["m_concat"].to(self.device, self.dtype)
 
         with torch.no_grad():
-            Xi = to_latent_sd3(self.vae, x_concat_in)           # [B,16,H/8,2W/8]
-            z0 = to_latent_sd3(self.vae, x_concat_gt)           # [B,16,H/8,2W/8]
-            Mi = F.interpolate(m_concat, size=(H // 8, (2 * W) // 8), mode="nearest")
+            # ---- 반드시 모델 dtype으로 통일 ----
+            Xi = to_latent_sd3(self.vae, x_concat_in).to(self.dtype)           # [B,16,H/8,2W/8]
+            z0 = to_latent_sd3(self.vae, x_concat_gt).to(self.dtype)           # [B,16,H/8,2W/8]
+            Mi = F.interpolate(m_concat, size=(H // 8, (2 * W) // 8), mode="nearest").to(self.dtype)
 
         B = Xi.shape[0]
 
         if self.cfg.cond_dropout_p > 0:
-            drop = (torch.rand(B, device=self.device) < self.cfg.cond_dropout_p).float().view(B, 1, 1, 1)
+            drop = (torch.rand(B, device=self.device, dtype=self.dtype) < self.cfg.cond_dropout_p).float().view(B, 1, 1, 1)
             Xi = Xi * (1.0 - drop)
             Mi = Mi * (1.0 - drop)
 
-        timesteps = torch.randint(0, self.scheduler.config.num_train_timesteps, (B,), device=self.device, dtype=torch.long)
-        sigmas = self.scheduler.sigmas[timesteps].view(B, 1, 1, 1).to(dtype=self.dtype)
+        timesteps = torch.randint(
+            0, self.scheduler.config.num_train_timesteps, (B,),
+            device=self.device, dtype=torch.long
+        )
+        sigmas = self.sigmas.index_select(0, timesteps).view(B, 1, 1, 1)  # 이미 dtype/device 맞춤
 
-        noise = torch.randn_like(z0)
+        # ---- noise도 dtype을 명시적으로 맞춤 ----
+        noise = torch.randn(z0.shape, device=self.device, dtype=self.dtype)
         noisy = sigmas * noise + (1.0 - sigmas) * z0
 
-        hidden_in = self.projector(torch.cat([noisy, Xi, Mi], dim=1))  # [B,16,h,w]
+        # ---- projector 입력 텐서 dtype 강제 일치 ----
+        hidden_in = self.projector(torch.cat([noisy, Xi, Mi], dim=1).to(self.dtype))
 
         prompt_embeds, pooled_prompt_embeds = self._encode_prompts(B)
 
-        with torch.cuda.amp.autocast(enabled=(self.dtype == torch.float16)):
+        with torch.amp.autocast('cuda', enabled=(self.dtype == torch.float16)):
             out = self.transformer(
                 hidden_states=hidden_in,
                 timestep=timesteps,
@@ -345,7 +373,7 @@ class CatVTON_SD3_Trainer:
         global_step = 0
         self.transformer.train()
         self.projector.train()
-        scaler = torch.cuda.amp.GradScaler(enabled=(self.dtype == torch.float16))
+        scaler = torch.amp.GradScaler('cuda', enabled=self.use_scaler)
 
         data_iter = itertools.cycle(self.loader)
 
@@ -353,25 +381,27 @@ class CatVTON_SD3_Trainer:
             self.optimizer.zero_grad(set_to_none=True)
             loss_accum = 0.0
 
+            # ===== accumulate =====
             for _ in range(self.cfg.grad_accum):
                 batch = next(data_iter)
-                with torch.cuda.amp.autocast(enabled=(self.dtype == torch.float16)):
-                    loss = self.step(batch, global_step)
+                loss = self.step(batch, global_step)
 
-                if self.dtype == torch.float16:
+                if self.use_scaler:
                     scaler.scale(loss).backward()
                 else:
                     loss.backward()
                 loss_accum += float(loss.detach().cpu())
 
-            if self.dtype == torch.float16:
+            # ===== clip & step =====
+            if self.use_scaler:
                 scaler.unscale_(self.optimizer)
+
             torch.nn.utils.clip_grad_norm_(
                 (p for p in self.transformer.parameters() if p.requires_grad), 1.0
             )
             torch.nn.utils.clip_grad_norm_(self.projector.parameters(), 1.0)
 
-            if self.dtype == torch.float16:
+            if self.use_scaler:
                 scaler.step(self.optimizer)
                 scaler.update()
             else:
