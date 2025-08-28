@@ -1,4 +1,7 @@
 __pycache__
+/DATA/
+*.jpg
+*.png
 model/__pycache__
 model/DensePose/__pycache__
 model/SCHP/__pycache__
