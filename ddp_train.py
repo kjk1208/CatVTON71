@@ -1,4 +1,4 @@
-# train.py  (YAML-first, no dataclass)  — with inference preview in col 6
+# train.py  (YAML-first, no dataclass) — DDP-ready, preview/save/log only on rank 0
 import os
 import json
 import random
@@ -14,6 +14,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 from PIL import Image
 from tqdm import tqdm
 from torchvision.utils import save_image, make_grid
@@ -88,6 +92,49 @@ class DotDict(dict):
     __delattr__ = dict.__delitem__
 
 
+# ---- DDP helpers ----
+def maybe_init_distributed() -> Dict[str, int]:
+    """
+    Initialize distributed if env vars exist. Safe to call once (main).
+    """
+    if dist.is_available() and not dist.is_initialized() and "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://")
+        return {"is_dist": True, "rank": rank, "world_size": world_size, "local_rank": local_rank}
+    return {"is_dist": False, "rank": 0, "world_size": 1, "local_rank": 0}
+
+
+def get_distributed_info() -> Dict[str, int]:
+    """Read current DDP state without initializing."""
+    if dist.is_available() and dist.is_initialized():
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        return {"is_dist": True, "rank": rank, "world_size": world_size, "local_rank": local_rank}
+    return {"is_dist": False, "rank": 0, "world_size": 1, "local_rank": 0}
+
+
+def bcast_object(obj, src: int = 0):
+    if dist.is_available() and dist.is_initialized():
+        lst = [obj]
+        dist.broadcast_object_list(lst, src=src)
+        return lst[0]
+    return obj
+
+
+class NoopWriter:
+    def add_scalar(self, *a, **k): pass
+    def close(self): pass
+
+
+def ddp_state_dict(m: nn.Module):
+    return m.module.state_dict() if isinstance(m, DDP) else m.state_dict()
+
+
 # ------------------------------------------------------------
 # Dataset
 # ------------------------------------------------------------
@@ -144,9 +191,12 @@ class PairListDataset(Dataset):
 
 
 # ------------------------------------------------------------
-# SD3.5 components + helpers
+# SD3.5 helpers
 # ------------------------------------------------------------
 def load_sd3_components(model_id: str, device, dtype, token: str = None, revision: str = None):
+    """
+    (Unused in DDP path below; left for reference)
+    """
     local_dir = snapshot_download(
         repo_id=model_id, token=token, revision=revision,
         resume_download=True, local_files_only=False,
@@ -218,9 +268,18 @@ def freeze_all_but_attn_sd3(transformer: SD3Transformer2DModel):
 class CatVTON_SD3_Trainer:
     def __init__(self, cfg: DotDict, run_dirs: Dict[str, str], cfg_yaml_to_save: Optional[Dict[str, Any]] = None):
         self.cfg = cfg
-        seed_everything(cfg.seed)
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # distributed info (do NOT init here)
+        dinfo = get_distributed_info()
+        self.is_dist = dinfo["is_dist"]
+        self.rank = dinfo["rank"]
+        self.world_size = dinfo["world_size"]
+        self.local_rank = dinfo["local_rank"]
+        self.is_main = (self.rank == 0)
+
+        seed_everything(cfg.seed + self.rank)
+
+        self.device = torch.device(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
         mp2dtype = {"fp16": torch.float16, "fp32": torch.float32, "bf16": torch.bfloat16}
         self.dtype = mp2dtype.get(cfg.mixed_precision, torch.float16)
 
@@ -229,23 +288,27 @@ class CatVTON_SD3_Trainer:
         self.img_dir = run_dirs["images"]
         self.model_dir = run_dirs["models"]
         self.tb_dir = run_dirs["tb"]
-        for d in [self.img_dir, self.model_dir, self.tb_dir]:
-            os.makedirs(d, exist_ok=True)
 
-        self.log_path = os.path.join(self.run_dir, "log.txt")
+        if self.is_main:
+            for d in [self.img_dir, self.model_dir, self.tb_dir]:
+                os.makedirs(d, exist_ok=True)
+
         self.logger = logging.getLogger(f"catvton_{os.path.basename(self.run_dir)}")
         self.logger.setLevel(logging.INFO)
         self.logger.propagate = False
-        if not self.logger.handlers:
+        if self.is_main and not self.logger.handlers:
+            self.log_path = os.path.join(self.run_dir, "log.txt")
             fh = logging.FileHandler(self.log_path)
             fh.setLevel(logging.INFO)
             fh.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
             self.logger.addHandler(fh)
+        else:
+            self.logger.addHandler(logging.NullHandler())
 
-        self.tb = SummaryWriter(self.tb_dir)
+        self.tb = SummaryWriter(self.tb_dir) if self.is_main else NoopWriter()
 
-        # save merged config.yaml
-        if cfg_yaml_to_save is not None and yaml is not None:
+        # save merged config.yaml (main only)
+        if cfg_yaml_to_save is not None and yaml is not None and self.is_main:
             with open(os.path.join(self.run_dir, "config.yaml"), "w") as f:
                 yaml.safe_dump(cfg_yaml_to_save, f, sort_keys=False)
 
@@ -254,39 +317,62 @@ class CatVTON_SD3_Trainer:
                      or os.environ.get("HUGGINGFACE_HUB_TOKEN")
                      or os.environ.get("HF_TOKEN"))
         token = cfg.hf_token or env_token
-        if token is None:
+        if token is None and self.is_main:
             msg = "[warn] No HF token found. If the repo is gated, set HUGGINGFACE_TOKEN or pass --hf_token."
             print(msg); self.logger.info(msg)
 
-        # Load SD3.5
-        self.vae, self.transformer, self.encode_prompt, self.scheduler = load_sd3_components(
-            cfg.sd3_model, self.device, self.dtype, token=token
-        )
-        self.logger.info(f"Loaded SD3 model: {cfg.sd3_model}")
+        # Load SD3.5 — rank0 downloads, others read cache
+        if self.is_main:
+            local_dir = snapshot_download(
+                repo_id=cfg.sd3_model, token=token, revision=None,
+                resume_download=True, local_files_only=False
+            )
+        if self.is_dist:
+            dist.barrier()
+        if not self.is_main:
+            local_dir = snapshot_download(
+                repo_id=cfg.sd3_model, token=token, revision=None,
+                resume_download=True, local_files_only=True
+            )
+
+        pipe = StableDiffusion3Pipeline.from_pretrained(
+            local_dir, torch_dtype=self.dtype, local_files_only=True, use_safetensors=True,
+        ).to(self.device)
+
+        self.vae = pipe.vae
+        self.transformer: SD3Transformer2DModel = pipe.transformer
+        self.encode_prompt = pipe.encode_prompt
+        self.scheduler = FlowMatchEulerDiscreteScheduler.from_config(pipe.scheduler.config)
+        if self.is_main:
+            self.logger.info(f"Loaded SD3 model: {cfg.sd3_model}")
 
         # Master FP32 sigmas
         self.sigmas_f32 = self.scheduler.sigmas.to(self.device, dtype=torch.float32)
 
-        # memory knobs
+        # memory knobs (before DDP wrap)
         try:
             self.transformer.enable_gradient_checkpointing()
             msg = "[mem] gradient checkpointing ON"
-            print(msg); self.logger.info(msg)
+            if self.is_main: print(msg)
+            self.logger.info(msg)
         except Exception as e:
             msg = f"[mem] gradient checkpointing not available: {e}"
-            print(msg); self.logger.info(msg)
+            if self.is_main: print(msg)
+            self.logger.info(msg)
         try:
             self.transformer.enable_xformers_memory_efficient_attention()
             msg = "[mem] xFormers attention ON"
-            print(msg); self.logger.info(msg)
+            if self.is_main: print(msg)
+            self.logger.info(msg)
         except Exception as e:
             msg = f"[mem] xFormers not available: {e}"
-            print(msg); self.logger.info(msg)
+            if self.is_main: print(msg)
+            self.logger.info(msg)
 
         # projector: keep FP32
         self.projector = ConcatProjector(in_ch=33, out_ch=16).to(self.device, dtype=torch.float32)
 
-        # freeze except attention
+        # freeze except attention (before DDP)
         trainable_tf = freeze_all_but_attn_sd3(self.transformer)
 
         # cast trainable(attn) params to FP32 when using fp16 training
@@ -297,36 +383,65 @@ class CatVTON_SD3_Trainer:
                     p.data = p.data.to(torch.float32)
                     casted += 1
         msg = f"[dtype] casted_trainable_to_fp32={casted}"
-        print(msg); self.logger.info(msg)
+        if self.is_main: print(msg)
+        self.logger.info(msg)
 
         proj_params = sum(p.numel() for p in self.projector.parameters())
         msg = f"Trainable params: transformer-attn={trainable_tf/1e6:.2f}M, projector={proj_params/1e6:.2f}M"
-        print(msg); self.logger.info(msg)
+        if self.is_main: print(msg)
+        self.logger.info(msg)
 
         # data
         self.dataset = PairListDataset(
             cfg.list_file, size_hw=(cfg.size_h, cfg.size_w),
             mask_based=cfg.mask_based, invert_mask=cfg.invert_mask
         )
+        if self.is_dist:
+            self.sampler = DistributedSampler(
+                self.dataset, num_replicas=self.world_size, rank=self.rank,
+                shuffle=True, drop_last=True
+            )
+        else:
+            self.sampler = None
+
         self.loader = DataLoader(
-            self.dataset, batch_size=cfg.batch_size, shuffle=True,
+            self.dataset,
+            batch_size=cfg.batch_size,
+            shuffle=(self.sampler is None),
+            sampler=self.sampler,
             num_workers=cfg.num_workers, pin_memory=True, drop_last=True
         )
-        self.logger.info(f"Dataset len={len(self.dataset)} batch_size={cfg.batch_size} invert_mask={cfg.invert_mask}")
+        self.logger.info(f"Dataset len={len(self.dataset)} batch_size(per-rank)={cfg.batch_size} invert_mask={cfg.invert_mask}")
 
-        self.steps_per_epoch = max(1, len(self.dataset) // cfg.batch_size)
+        if self.is_dist:
+            self.steps_per_epoch = max(1, self.sampler.num_samples // cfg.batch_size)
+        else:
+            self.steps_per_epoch = max(1, len(self.dataset) // cfg.batch_size)
 
         # AMP/GradScaler
         self.use_scaler = (self.device.type == "cuda") and (self.dtype == torch.float16)
         msg = f"[amp] dtype={self.dtype}, use_scaler={self.use_scaler}"
-        print(msg); self.logger.info(msg)
+        if self.is_main: print(msg)
+        self.logger.info(msg)
+
+        # DDP wrap (after freezing/casting)
+        self.transformer = DDP(
+            self.transformer, device_ids=[self.local_rank], output_device=self.local_rank,
+            broadcast_buffers=False, find_unused_parameters=False
+        )
+        self.projector = DDP(
+            self.projector, device_ids=[self.local_rank], output_device=self.local_rank,
+            broadcast_buffers=False, find_unused_parameters=False
+        )
 
         # optimizer
         optim_params = itertools.chain(
             (p for p in self.transformer.parameters() if p.requires_grad),
             self.projector.parameters()
         )
-        self.optimizer = torch.optim.AdamW(optim_params, lr=cfg.lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
+        self.optimizer = torch.optim.AdamW(
+            optim_params, lr=cfg.lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0
+        )
 
         self._has_scale_model_input = hasattr(self.scheduler, "scale_model_input")
 
@@ -352,15 +467,13 @@ class CatVTON_SD3_Trainer:
     def _denorm(self, x: torch.Tensor) -> torch.Tensor:
         return torch.clamp((x + 1.0) * 0.5, 0.0, 1.0)
 
-    # --- 추가: timesteps 강제 1D 변환 헬퍼 ---
+    # --- timesteps helpers ---
     def _as_1d_timesteps(self, sample: torch.Tensor, t, B: int) -> torch.Tensor:
-        # t -> torch.Tensor on same device/dtype, shape (B,)
         if not torch.is_tensor(t):
             t = torch.tensor([t], device=sample.device)
         t = t.to(sample.device)
         if t.ndim == 0:
             t = t[None]
-        # 스케줄러 timesteps dtype 따라가되 없으면 long 사용
         tdtype = getattr(self.scheduler, "timesteps", torch.tensor([], device=sample.device)).dtype \
                 if hasattr(self.scheduler, "timesteps") else torch.long
         t = t.to(tdtype)
@@ -368,7 +481,6 @@ class CatVTON_SD3_Trainer:
             t = t[:1].repeat(B)
         return t
 
-    # --- 수정: 항상 1D로 만들어 scale_model_input 호출 ---
     def _scale_model_input_safe(self, sample: torch.Tensor, timesteps) -> torch.Tensor:
         if not self._has_scale_model_input:
             return sample
@@ -377,10 +489,8 @@ class CatVTON_SD3_Trainer:
             t1d = self._as_1d_timesteps(sample, timesteps, B)
             return self.scheduler.scale_model_input(sample, t1d)
         except Exception as e:
-            # 프리뷰는 모니터링용이니 실패 시 그냥 원본 사용
             self.logger.info(f"[scale_model_input_safe] bypass: {e}")
             return sample
-
 
     @torch.no_grad()
     def _preview_sample(self, batch: Dict[str, torch.Tensor], num_steps: int) -> torch.Tensor:
@@ -392,7 +502,7 @@ class CatVTON_SD3_Trainer:
         Mi = F.interpolate(m, size=(H // 8, (2 * W) // 8), mode="nearest").to(self.dtype)
         B, C, h, w = Xi.shape
 
-        # timesteps / init noise (device 지정!)
+        # timesteps / init noise (device 지정)
         self.scheduler.set_timesteps(num_steps, device=self.device)
         sigma0 = float(self.scheduler.sigmas[0])
         z = torch.randn((B, C, h, w), generator=self._preview_gen,
@@ -402,19 +512,19 @@ class CatVTON_SD3_Trainer:
         prompt_embeds, pooled = self._encode_prompts(B)
 
         for t in self.scheduler.timesteps:
-            t1d = self._as_1d_timesteps(z, t, B)     # (B,)로 확장
-
+            t1d = self._as_1d_timesteps(z, t, B)  # (B,)
             z_in  = self._scale_model_input_safe(z,  t1d)
             Xi_in = self._scale_model_input_safe(Xi.float(), t1d)
 
             hidden = torch.cat([z_in.float(), Xi_in, Mi.float()], dim=1)
             hidden = torch.nan_to_num(hidden, nan=0.0, posinf=30.0, neginf=-30.0).clamp_(-30.0, 30.0)
 
-            proj = self.projector(hidden).to(self.dtype)
+            proj = self.projector.module(hidden).to(self.dtype) if isinstance(self.projector, DDP) else self.projector(hidden).to(self.dtype)
             with torch.amp.autocast('cuda', enabled=(self.dtype == torch.float16)):
-                v = self.transformer(
-                    hidden_states=proj,        
-                    timestep=t1d,          # <-- (B,) 텐서로 변경
+                model = self.transformer.module if isinstance(self.transformer, DDP) else self.transformer
+                v = model(
+                    hidden_states=proj,
+                    timestep=t1d,
                     encoder_hidden_states=prompt_embeds,
                     pooled_projections=pooled,
                     return_dict=True,
@@ -427,15 +537,12 @@ class CatVTON_SD3_Trainer:
 
     @torch.no_grad()
     def _save_preview(self, batch: Dict[str, torch.Tensor], global_step: int, max_rows: int = 4):
-        """
-        Monitoring preview (7 cols):
-        [person, keep-mask, masked_person, garment, concat_in, pred(infer), concat_gt]
-        """
+        if not self.is_main:
+            return
         x_in = batch["x_concat_in"][:max_rows].to(self.device)
         x_gt = batch["x_concat_gt"][:max_rows].to(self.device)
         m    = batch["m_concat"][:max_rows].to(self.device)
 
-        # inference with current weights
         pred_img = self._preview_sample(
             {k: v[:max_rows] for k, v in batch.items()}, num_steps=self.cfg.preview_infer_steps
         )  # [B,3,H,2W] in [0,1]
@@ -507,13 +614,15 @@ class CatVTON_SD3_Trainer:
         hidden_cat_f32 = torch.nan_to_num(hidden_cat_f32, nan=0.0, posinf=30.0, neginf=-30.0)
         hidden_cat_f32 = torch.clamp(hidden_cat_f32, -30.0, 30.0)
 
-        proj_out_f32 = self.projector(hidden_cat_f32)                # FP32
+        proj_out_f32 = (self.projector.module(hidden_cat_f32) if isinstance(self.projector, DDP)
+                        else self.projector(hidden_cat_f32))                # FP32
         hidden_in    = proj_out_f32.to(self.dtype)
 
         prompt_embeds, pooled_prompt_embeds = self._encode_prompts(B)
 
         with torch.amp.autocast('cuda', enabled=(self.dtype == torch.float16)):
-            out = self.transformer(
+            model = self.transformer
+            out = model(
                 hidden_states=hidden_in,
                 timestep=timesteps,
                 encoder_hidden_states=prompt_embeds,
@@ -532,16 +641,17 @@ class CatVTON_SD3_Trainer:
     def _save_ckpt(self, epoch: int, train_loss_epoch: float, global_step: int) -> str:
         ckpt_path = os.path.join(self.model_dir, f"[Train]_[{epoch}]_[{train_loss_epoch:.04f}].ckpt")
         payload = {
-            "transformer": self.transformer.state_dict(),
-            "projector": self.projector.state_dict(),
+            "transformer": ddp_state_dict(self.transformer),
+            "projector": ddp_state_dict(self.projector),
             "optimizer": self.optimizer.state_dict(),
             "cfg": dict(self.cfg),
             "epoch": epoch,
             "global_step": global_step,
             "train_loss_epoch": float(train_loss_epoch),
         }
-        torch.save(payload, ckpt_path)
-        self.logger.info(f"[save] {ckpt_path}")
+        if self.is_main:
+            torch.save(payload, ckpt_path)
+            self.logger.info(f"[save] {ckpt_path}")
         return ckpt_path
 
     def train(self):
@@ -558,8 +668,11 @@ class CatVTON_SD3_Trainer:
             dynamic_ncols=True,
             desc=f"Epoch {epoch}",
             leave=True,
-            disable=not sys.stdout.isatty()
+            disable=(not self.is_main) or (not sys.stdout.isatty())
         )
+
+        if self.is_dist and self.sampler is not None:
+            self.sampler.set_epoch(epoch)
 
         while global_step < self.cfg.max_steps:
             self.optimizer.zero_grad(set_to_none=True)
@@ -589,12 +702,15 @@ class CatVTON_SD3_Trainer:
 
             if nonfinite:
                 msg = f"[warn] skipping step {global_step}: {reason}."
-                pbar.write(msg); self.logger.info(msg)
+                if self.is_main:
+                    pbar.write(msg)
+                self.logger.info(msg)
                 self.optimizer.zero_grad(set_to_none=True)
                 if self.use_scaler:
                     scaler.update()
                 global_step += 1
-                pbar.update(1)
+                if self.is_main:
+                    pbar.update(1)
                 continue
 
             do_clip = True
@@ -603,7 +719,9 @@ class CatVTON_SD3_Trainer:
                     scaler.unscale_(self.optimizer)
                 except ValueError as e:
                     msg = f"[amp] unscale_ skipped: {e}"
-                    pbar.write(msg); self.logger.info(msg)
+                    if self.is_main:
+                        pbar.write(msg)
+                    self.logger.info(msg)
                     do_clip = False
 
             if do_clip:
@@ -619,13 +737,14 @@ class CatVTON_SD3_Trainer:
                 self.optimizer.step()
 
             global_step += 1
-            pbar.update(1)
+            if self.is_main:
+                pbar.update(1)
 
             self._epoch_loss_sum += loss_accum / max(1, self.cfg.grad_accum)
             self._epoch_loss_count += 1
             train_loss_avg = self._epoch_loss_sum / max(1, self._epoch_loss_count)
 
-            if (global_step % self.cfg.log_every) == 0 or global_step == 1:
+            if self.is_main and ((global_step % self.cfg.log_every) == 0 or global_step == 1):
                 self.tb.add_scalar("train/loss", train_loss_avg, global_step)
                 prog = (global_step % self.steps_per_epoch) / self.steps_per_epoch if self.steps_per_epoch > 0 else 0.0
                 pct = int(prog * 100)
@@ -635,7 +754,7 @@ class CatVTON_SD3_Trainer:
                 pbar.write(line)
                 self.logger.info(line)
 
-            if (global_step % self.cfg.image_every) == 0 or global_step == 1:
+            if self.is_main and ((global_step % self.cfg.image_every) == 0 or global_step == 1):
                 try:
                     self._save_preview(batch, global_step, max_rows=min(4, self.cfg.batch_size))
                     pbar.write(f"[img] saved preview at step {global_step}")
@@ -643,24 +762,32 @@ class CatVTON_SD3_Trainer:
                     msg = f"[warn] preview save failed: {e}"
                     pbar.write(msg); self.logger.info(msg)
 
-            if (global_step % self.cfg.save_every) == 0:
+            if self.is_main and ((global_step % self.cfg.save_every) == 0 or (self.cfg.max_steps == global_step)):
                 path = self._save_ckpt(epoch, train_loss_avg, global_step)
                 pbar.write(f"[save] {path}")
 
             if (global_step % self.steps_per_epoch) == 0:
-                path = self._save_ckpt(epoch, train_loss_avg, global_step)
-                pbar.write(f"[save-epoch] {path}")
+                if self.is_main:
+                    path = self._save_ckpt(epoch, train_loss_avg, global_step)
+                    pbar.write(f"[save-epoch] {path}")
                 self._epoch_loss_sum = 0.0
                 self._epoch_loss_count = 0
                 epoch += 1
-                pbar.set_description(f"Epoch {epoch}")
+                if self.is_main:
+                    pbar.set_description(f"Epoch {epoch}")
+                if self.is_dist and self.sampler is not None:
+                    self.sampler.set_epoch(epoch)
 
         final_loss = self._epoch_loss_sum / max(1, self._epoch_loss_count) if self._epoch_loss_count > 0 else 0.0
-        path = self._save_ckpt(epoch, final_loss, global_step)
-        pbar.write(f"[final] {path}")
+        if self.is_main:
+            path = self._save_ckpt(epoch, final_loss, global_step)
+            pbar.write(f"[final] {path}")
         pbar.close()
-        self.tb.close()
+        if self.is_main:
+            self.tb.close()
         self.logger.info("[done] training finished")
+        if self.is_dist:
+            dist.barrier()
 
 
 # ------------------------------------------------------------
@@ -674,13 +801,13 @@ DEFAULTS = {
     "mask_based": True, "invert_mask": False,
 
     # opt
-    "lr": 1e-5, "batch_size": 4, "grad_accum": 1, "max_steps": 16000,
+    "lr": 1e-5, "batch_size": 4, "grad_accum": 1, "max_steps": 128000,
     "seed": 1337, "num_workers": 4, "cond_dropout_p": 0.1,
     "mixed_precision": "fp16", "loss_sigma_weight": False,
 
     # logging / save
     "save_root_dir": "logs", "save_name": "catvton_sd35",
-    "log_every": 50, "image_every": 500, "save_every": 2000,
+    "log_every": 50, "image_every": 500, "save_every": 12800,
 
     # preview sampling
     "preview_infer_steps": 16,
@@ -755,9 +882,10 @@ def load_merge_config(args: argparse.Namespace) -> DotDict:
     return DotDict(cfg)
 
 
-def build_run_dirs(cfg: DotDict) -> Dict[str, str]:
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"{ts}_{cfg.save_name}"
+def build_run_dirs(cfg: DotDict, run_name: Optional[str] = None, create: bool = True) -> Dict[str, str]:
+    if run_name is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_name = f"{ts}_{cfg.save_name}"
     run_dir = os.path.join(cfg.save_root_dir, run_name)
     paths = {
         "run_dir": run_dir,
@@ -765,20 +893,37 @@ def build_run_dirs(cfg: DotDict) -> Dict[str, str]:
         "models": os.path.join(run_dir, "models"),
         "tb": os.path.join(run_dir, "tb"),
     }
-    for d in paths.values():
-        os.makedirs(d, exist_ok=True)
+    if create:
+        for d in paths.values():
+            os.makedirs(d, exist_ok=True)
     return paths
 
 
 def main():
     args = parse_args()
     cfg = load_merge_config(args)
-    run_dirs = build_run_dirs(cfg)
-    # save merged config for reproducibility
-    cfg_yaml_to_save = dict(cfg)
+
+    # init DDP once (main function)
+    dinfo = maybe_init_distributed()
+    is_dist = dinfo["is_dist"]
+    rank = dinfo["rank"]
+
+    # one shared run_name across ranks
+    run_name = None
+    if rank == 0:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_name = f"{ts}_{cfg.save_name}"
+    run_name = bcast_object(run_name, src=0)
+    run_dirs = build_run_dirs(cfg, run_name=run_name, create=(rank == 0))
+
+    # save merged config only on rank 0
+    cfg_yaml_to_save = dict(cfg) if rank == 0 else None
 
     trainer = CatVTON_SD3_Trainer(cfg, run_dirs, cfg_yaml_to_save=cfg_yaml_to_save)
     trainer.train()
+
+    if is_dist:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

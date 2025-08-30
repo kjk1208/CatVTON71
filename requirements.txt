@@ -1,6 +1,6 @@
 # ---- Core PyTorch stack (CUDA 빌드에 맞춰 우선 설치) ----
-torch==2.4.0
-torchvision==0.19.0
+#torch==2.4.0
+#torchvision==0.19.0
 
 # ---- HF / Diffusion stack ----
 diffusers==0.35.1
@@ -35,3 +35,4 @@ hf_transfer>=0.1.6
 
 protobuf==4.25.3
 sentencepiece>=0.1.99
+tensorboard

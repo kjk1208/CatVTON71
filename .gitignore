@@ -1,5 +1,6 @@
 __pycache__
 /DATA/
+/logs/
 *.jpg
 *.png
 model/__pycache__
