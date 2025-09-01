@@ -1,7 +1,7 @@
 python make_vitonhd_csv.py \
   --root DATA/VITON-HD \
-  --split train \
-  --out vitonhd_train_mask.csv \
+  --split test \
+  --out vitonhd_test_mask.csv \
   --mode mask \
   --check_mask
 

@@ -1,4 +1,4 @@
-# train.py  (YAML-first, no dataclass) — DDP-ready, preview/save/log only on rank 0
+# train.py  (YAML-first, no dataclass) — DDP-ready, FlowMatch-correct, preview/save/log only on rank 0
 import os
 import json
 import random
@@ -346,9 +346,6 @@ class CatVTON_SD3_Trainer:
         if self.is_main:
             self.logger.info(f"Loaded SD3 model: {cfg.sd3_model}")
 
-        # Master FP32 sigmas
-        self.sigmas_f32 = self.scheduler.sigmas.to(self.device, dtype=torch.float32)
-
         # memory knobs (before DDP wrap)
         try:
             self.transformer.enable_gradient_checkpointing()
@@ -502,9 +499,10 @@ class CatVTON_SD3_Trainer:
         Mi = F.interpolate(m, size=(H // 8, (2 * W) // 8), mode="nearest").to(self.dtype)
         B, C, h, w = Xi.shape
 
-        # timesteps / init noise (device 지정)
+        # timesteps / init noise
         self.scheduler.set_timesteps(num_steps, device=self.device)
-        sigma0 = float(self.scheduler.sigmas[0])
+        sigma0 = float(getattr(self.scheduler, "init_noise_sigma",
+                               self.scheduler.sigmas[0] if hasattr(self.scheduler, "sigmas") else 1.0))
         z = torch.randn((B, C, h, w), generator=self._preview_gen,
                         device=self.device, dtype=torch.float32) * sigma0
         z = z.to(self.dtype)
@@ -520,7 +518,7 @@ class CatVTON_SD3_Trainer:
             hidden = torch.nan_to_num(hidden, nan=0.0, posinf=30.0, neginf=-30.0).clamp_(-30.0, 30.0)
 
             proj = self.projector.module(hidden).to(self.dtype) if isinstance(self.projector, DDP) else self.projector(hidden).to(self.dtype)
-            with torch.amp.autocast('cuda', enabled=(self.dtype == torch.float16)):
+            with torch.amp.autocast(device_type='cuda', dtype=self.dtype, enabled=(self.device.type == 'cuda')):
                 model = self.transformer.module if isinstance(self.transformer, DDP) else self.transformer
                 v = model(
                     hidden_states=proj,
@@ -599,12 +597,19 @@ class CatVTON_SD3_Trainer:
             device=self.device, dtype=torch.long
         )
 
-        # --------- Build noisy in FP32 ---------
-        sigmas_f32 = self.sigmas_f32.index_select(0, timesteps).view(B, 1, 1, 1)
+        # --------- Build noisy & target (FlowMatchEuler 정식) ---------
         z0_f32     = z0.float()
-        noise_f32  = torch.randn(z0.shape, device=self.device, dtype=torch.float32)
-        noisy_f32  = sigmas_f32 * noise_f32 + (1.0 - sigmas_f32) * z0_f32
+        noise_f32  = torch.randn_like(z0_f32)
+        noisy_f32  = self.scheduler.add_noise(original_samples=z0_f32, noise=noise_f32, timesteps=timesteps)
         noisy_f32  = torch.nan_to_num(noisy_f32, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        pred_type = getattr(self.scheduler.config, "prediction_type", "v_prediction")
+        if pred_type == "epsilon":
+            target_f32 = noise_f32
+        elif pred_type == "v_prediction":
+            target_f32 = self.scheduler.get_velocity(sample=z0_f32, noise=noise_f32, timesteps=timesteps)
+        else:
+            raise ValueError(f"Unsupported prediction_type: {pred_type}")
 
         # --------- (safe) preconditioning ---------
         scaled_noisy_f32 = self._scale_model_input_safe(noisy_f32, timesteps)
@@ -620,7 +625,7 @@ class CatVTON_SD3_Trainer:
 
         prompt_embeds, pooled_prompt_embeds = self._encode_prompts(B)
 
-        with torch.amp.autocast('cuda', enabled=(self.dtype == torch.float16)):
+        with torch.amp.autocast(device_type='cuda', dtype=self.dtype, enabled=(self.device.type == 'cuda')):
             model = self.transformer
             out = model(
                 hidden_states=hidden_in,
@@ -630,9 +635,7 @@ class CatVTON_SD3_Trainer:
                 return_dict=True,
             ).sample
 
-        target_f32 = (noise_f32 - z0_f32) / (sigmas_f32 + 1.0 + 1e-3)
-        out_f32    = out.float()
-
+        out_f32 = out.float()
         loss = F.mse_loss(out_f32, target_f32, reduction="mean")
         if not torch.isfinite(loss) or not loss.requires_grad:
             return None
@@ -762,17 +765,13 @@ class CatVTON_SD3_Trainer:
                     msg = f"[warn] preview save failed: {e}"
                     pbar.write(msg); self.logger.info(msg)
 
-            if self.is_main and ((global_step % self.cfg.save_every) == 0 or (self.cfg.max_steps == global_step)):
-                path = self._save_ckpt(epoch, train_loss_avg, global_step)
-                pbar.write(f"[save] {path}")
-
             if (global_step % self.steps_per_epoch) == 0:
-                if self.is_main:
+                epoch += 1
+                if self.is_main and (epoch % self.cfg.save_epoch_ckpt) == 0:  # every N epochs
                     path = self._save_ckpt(epoch, train_loss_avg, global_step)
                     pbar.write(f"[save-epoch] {path}")
                 self._epoch_loss_sum = 0.0
                 self._epoch_loss_count = 0
-                epoch += 1
                 if self.is_main:
                     pbar.set_description(f"Epoch {epoch}")
                 if self.is_dist and self.sampler is not None:
@@ -808,6 +807,7 @@ DEFAULTS = {
     # logging / save
     "save_root_dir": "logs", "save_name": "catvton_sd35",
     "log_every": 50, "image_every": 500, "save_every": 12800,
+    "save_epoch_ckpt": 15,
 
     # preview sampling
     "preview_infer_steps": 16,

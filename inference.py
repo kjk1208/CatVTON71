@@ -1,325 +1,359 @@
+# inference.py — FlowMatch-correct SD3.5 inference for CatVTON
 import os
-import numpy as np
-import torch
+import csv
+import json
 import argparse
-from torch.utils.data import Dataset, DataLoader
-from diffusers.image_processor import VaeImageProcessor
-from tqdm import tqdm
-from PIL import Image, ImageFilter
+from typing import Tuple, Dict, Any, List
 
-from model.pipeline import CatVTONPipeline
+import numpy as np
+from PIL import Image
 
-class InferenceDataset(Dataset):
-    def __init__(self, args):
-        self.args = args
-    
-        self.vae_processor = VaeImageProcessor(vae_scale_factor=8) 
-        self.mask_processor = VaeImageProcessor(vae_scale_factor=8, do_normalize=False, do_binarize=True, do_convert_grayscale=True) 
-        self.data = self.load_data()
-    
-    def load_data(self):
-        return []
-    
-    def __len__(self):
-        return len(self.data)
-    
-    def __getitem__(self, idx):
-        data = self.data[idx]
-        person, cloth, mask = [Image.open(data[key]) for key in ['person', 'cloth', 'mask']]
-        return {
-            'index': idx,
-            'person_name': data['person_name'],
-            'person': self.vae_processor.preprocess(person, self.args.height, self.args.width)[0],
-            'cloth': self.vae_processor.preprocess(cloth, self.args.height, self.args.width)[0],
-            'mask': self.mask_processor.preprocess(mask, self.args.height, self.args.width)[0]
-        }
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.utils import save_image, make_grid
 
-class VITONHDTestDataset(InferenceDataset):
-    def load_data(self):
-        assert os.path.exists(pair_txt:=os.path.join(self.args.data_root_path, 'test_pairs_unpaired.txt')), f"File {pair_txt} does not exist."
-        with open(pair_txt, 'r') as f:
-            lines = f.readlines()
-        self.args.data_root_path = os.path.join(self.args.data_root_path, "test")
-        output_dir = os.path.join(self.args.output_dir, "vitonhd", 'unpaired' if not self.args.eval_pair else 'paired')
-        data = []
-        for line in lines:
-            person_img, cloth_img = line.strip().split(" ")
-            if os.path.exists(os.path.join(output_dir, person_img)):
-                continue
-            if self.args.eval_pair:
-                cloth_img = person_img
-            data.append({
-                'person_name': person_img,
-                'person': os.path.join(self.args.data_root_path, 'image', person_img),
-                'cloth': os.path.join(self.args.data_root_path, 'cloth', cloth_img),
-                'mask': os.path.join(self.args.data_root_path, 'agnostic-mask', person_img.replace('.jpg', '_mask.png')),
-            })
-        return data
+try:
+    from diffusers import StableDiffusion3Pipeline
+    from diffusers.models.transformers.transformer_sd3 import SD3Transformer2DModel
+    from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+except Exception as e:
+    raise ImportError(
+        "This script requires diffusers with SD3 support. "
+        "Install: pip install -U 'diffusers>=0.34.0' 'transformers>=4.41.0' 'safetensors>=0.4.3'"
+    ) from e
 
-class DressCodeTestDataset(InferenceDataset):
-    def load_data(self):
-        data = []
-        for sub_folder in ['upper_body', 'lower_body', 'dresses']:
-            assert os.path.exists(os.path.join(self.args.data_root_path, sub_folder)), f"Folder {sub_folder} does not exist."
-            pair_txt = os.path.join(self.args.data_root_path, sub_folder, 'test_pairs_paired.txt' if self.args.eval_pair else 'test_pairs_unpaired.txt')
-            assert os.path.exists(pair_txt), f"File {pair_txt} does not exist."
-            with open(pair_txt, 'r') as f:
-                lines = f.readlines()
+from huggingface_hub import snapshot_download
 
-            output_dir = os.path.join(self.args.output_dir, f"dresscode-{self.args.height}", 
-                                      'unpaired' if not self.args.eval_pair else 'paired', sub_folder)
-            for line in lines:
-                person_img, cloth_img = line.strip().split(" ")
-                if os.path.exists(os.path.join(output_dir, person_img)):
-                    continue
-                data.append({
-                    'person_name': os.path.join(sub_folder, person_img),
-                    'person': os.path.join(self.args.data_root_path, sub_folder, 'images', person_img),
-                    'cloth': os.path.join(self.args.data_root_path, sub_folder, 'images', cloth_img),
-                    'mask': os.path.join(self.args.data_root_path, sub_folder, 'agnostic_masks', person_img.replace('.jpg', '.png'))
-                })
-        return data
-                    
-       
-def parse_args():
-    parser = argparse.ArgumentParser(description="Simple example of a training script.")
-    parser.add_argument(
-        "--base_model_path",
-        type=str,
-        default="booksforcharlie/stable-diffusion-inpainting",  # Change to a copy repo as runawayml delete original repo
-        help=(
-            "The path to the base model to use for evaluation. This can be a local path or a model identifier from the Model Hub."
-        ),
-    )
-    parser.add_argument(
-        "--resume_path",
-        type=str,
-        default="zhengchong/CatVTON",
-        help=(
-            "The Path to the checkpoint of trained tryon model."
-        ),
-    )
-    parser.add_argument(
-        "--dataset_name",
-        type=str,
-        required=True,
-        help="The datasets to use for evaluation.",
-    )
-    parser.add_argument(
-        "--data_root_path", 
-        type=str, 
-        required=True,
-        help="Path to the dataset to evaluate."
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="output",
-        help="The output directory where the model predictions will be written.",
-    )
+# ---------- Utils (same as train) ----------
+def seed_everything(seed: int):
+    import random
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-    parser.add_argument(
-        "--seed", type=int, default=555, help="A seed for reproducible evaluation."
-    )
-    parser.add_argument(
-        "--batch_size", type=int, default=8, help="The batch size for evaluation."
-    )
-    
-    parser.add_argument(
-        "--num_inference_steps",
-        type=int,
-        default=50,
-        help="Number of inference steps to perform.",
-    )
-    parser.add_argument(
-        "--guidance_scale",
-        type=float,
-        default=2.5,
-        help="The scale of classifier-free guidance for inference.",
-    )
+def from_uint8(img: Image.Image, size_hw: Tuple[int, int]) -> torch.Tensor:
+    # PIL -> [-1,1] CHW float tensor
+    img = img.convert("RGB").resize(size_hw[::-1], Image.BICUBIC)
+    x = torch.from_numpy(np.array(img, dtype=np.float32))  # HWC
+    x = x.permute(2, 0, 1) / 255.0                         # CHW
+    x = x * 2.0 - 1.0
+    return x
 
-    parser.add_argument(
-        "--width",
-        type=int,
-        default=384,
-        help=(
-            "The resolution for input images, all the images in the train/validation dataset will be resized to this"
-            " resolution"
-        ),
-    )
-    parser.add_argument(
-        "--height",
-        type=int,
-        default=512,
-        help=(
-            "The resolution for input images, all the images in the train/validation dataset will be resized to this"
-            " resolution"
-        ),
-    )
-    parser.add_argument(
-        "--repaint", 
-        action="store_true", 
-        help="Whether to repaint the result image with the original background."
-    )
-    parser.add_argument(
-        "--eval_pair",
-        action="store_true",
-        help="Whether or not to evaluate the pair.",
-    )
-    parser.add_argument(
-        "--concat_eval_results",
-        action="store_true",
-        help="Whether or not to  concatenate the all conditions into one image.",
-    )
-    parser.add_argument(
-        "--allow_tf32",
-        action="store_true",
-        default=True,
-        help=(
-            "Whether or not to allow TF32 on Ampere GPUs. Can be used to speed up training. For more information, see"
-            " https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices"
-        ),
-    )
-    parser.add_argument(
-        "--dataloader_num_workers",
-        type=int,
-        default=8,
-        help=(
-            "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
-        ),
-    )
-    parser.add_argument(
-        "--mixed_precision",
-        type=str,
-        default="bf16",
-        choices=["no", "fp16", "bf16"],
-        help=(
-            "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
-            " 1.10.and an Nvidia Ampere GPU.  Default to the value of accelerate config of the current system or the"
-            " flag passed with the `accelerate.launch` command. Use this argument to override the accelerate config."
-        ),
-    )
-
-    parser.add_argument(
-        "--concat_axis",
-        type=str,
-        choices=["x", "y", 'random'],
-        default="y",
-        help="The axis to concat the cloth feature, select from ['x', 'y', 'random'].",
-    )
-    parser.add_argument(
-        "--enable_condition_noise",
-        action="store_true",
-        default=True,
-        help="Whether or not to enable condition noise.",
-    )
-    
-    args = parser.parse_args()
-    env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
-    if env_local_rank != -1 and env_local_rank != args.local_rank:
-        args.local_rank = env_local_rank
-
-    return args
-
-
-def repaint(person, mask, result):
-    _, h = result.size
-    kernal_size = h // 50
-    if kernal_size % 2 == 0:
-        kernal_size += 1
-    mask = mask.filter(ImageFilter.GaussianBlur(kernal_size))
-    person_np = np.array(person)
-    result_np = np.array(result)
-    mask_np = np.array(mask) / 255
-    repaint_result = person_np * (1 - mask_np) + result_np * mask_np
-    repaint_result = Image.fromarray(repaint_result.astype(np.uint8))
-    return repaint_result
-
-def to_pil_image(images):
-    images = (images / 2 + 0.5).clamp(0, 1)
-    images = images.cpu().permute(0, 2, 3, 1).float().numpy()
-    if images.ndim == 3:
-        images = images[None, ...]
-    images = (images * 255).round().astype("uint8")
-    if images.shape[-1] == 1:
-        # special case for grayscale (single channel) images
-        pil_images = [Image.fromarray(image.squeeze(), mode="L") for image in images]
-    else:
-        pil_images = [Image.fromarray(image) for image in images]
-    return pil_images
+def load_mask(p: str, size_hw: Tuple[int, int]) -> torch.Tensor:
+    m = Image.open(p).convert("L").resize(size_hw[::-1], Image.NEAREST)
+    t = torch.from_numpy(np.array(m, dtype=np.float32)) / 255.0
+    t = (t > 0.5).float().unsqueeze(0)  # (1,H,W)
+    return t
 
 @torch.no_grad()
+def to_latent_sd3(vae, x_bchw: torch.Tensor) -> torch.Tensor:
+    posterior = vae.encode(x_bchw).latent_dist
+    latents = posterior.sample()
+    sf = vae.config.scaling_factor
+    sh = getattr(vae.config, "shift_factor", 0.0)
+    latents = (latents - sh) * sf
+    return latents
+
+@torch.no_grad()
+def from_latent_sd3(vae, z: torch.Tensor) -> torch.Tensor:
+    sf = vae.config.scaling_factor
+    sh = getattr(vae.config, "shift_factor", 0.0)
+    z = z / sf + sh
+    img = vae.decode(z).sample  # [-1,1]
+    return img
+
+class ConcatProjector(nn.Module):
+    # 16 (z) + 16 (Xi) + 1 (mask) = 33 -> 16
+    def __init__(self, in_ch=33, out_ch=16):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, 32, kernel_size=1, bias=False),
+            nn.GroupNorm(8, 32),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(32, out_ch, kernel_size=1, bias=True),
+        )
+        for m in self.net.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+
+    def forward(self, x):
+        return self.net(x)
+
+def _as_1d_timesteps(scheduler, sample: torch.Tensor, t, B: int) -> torch.Tensor:
+    if not torch.is_tensor(t):
+        t = torch.tensor([t], device=sample.device)
+    t = t.to(sample.device)
+    if t.ndim == 0:
+        t = t[None]
+    tdtype = getattr(scheduler, "timesteps", torch.tensor([], device=sample.device)).dtype \
+             if hasattr(scheduler, "timesteps") else torch.long
+    t = t.to(tdtype)
+    if t.shape[0] != B:
+        t = t[:1].repeat(B)
+    return t
+
+def _scale_model_input_safe(scheduler, sample: torch.Tensor, timesteps) -> torch.Tensor:
+    if not hasattr(scheduler, "scale_model_input"):
+        return sample
+    try:
+        B = sample.shape[0]
+        t1d = _as_1d_timesteps(scheduler, sample, timesteps, B)
+        return scheduler.scale_model_input(sample, t1d)
+    except Exception:
+        return sample
+
+def _denorm01(x: torch.Tensor) -> torch.Tensor:
+    return torch.clamp((x + 1.0) * 0.5, 0.0, 1.0)
+
+# ---------- Dataset for CSV (image, cloth, agnostic-mask) ----------
+class CSVVitonDataset(torch.utils.data.Dataset):
+    def __init__(self, csv_path: str, size_h: int, size_w: int, invert_mask: bool = False):
+        super().__init__()
+        self.items: List[Dict[str, str]] = []
+        with open(csv_path, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            # expected headers: image, cloth, agnostic-mask
+            if not set(["image", "cloth", "agnostic-mask"]).issubset(set(reader.fieldnames or [])):
+                raise ValueError("CSV must have headers: image, cloth, agnostic-mask")
+            for row in reader:
+                self.items.append({
+                    "person": row["image"],
+                    "garment": row["cloth"],
+                    "mask": row["agnostic-mask"],
+                })
+        self.H, self.W = size_h, size_w
+        self.invert_mask = invert_mask
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx):
+        meta = self.items[idx]
+        person = Image.open(meta["person"])
+        garment = Image.open(meta["garment"])
+        mask_p = meta["mask"]
+
+        x_p = from_uint8(person, (self.H, self.W))
+        x_g = from_uint8(garment, (self.H, self.W))
+
+        m = load_mask(mask_p, (self.H, self.W))
+        if self.invert_mask:
+            m = 1.0 - m
+        x_p_in = x_p * m
+
+        x_concat_in = torch.cat([x_p_in, x_g], dim=2)  # [3,H,2W]
+        # no GT in pure inference; keep person & garment separately for panel
+        return {
+            "x_p": x_p, "x_g": x_g, "m": m,
+            "x_concat_in": x_concat_in,
+            "paths": meta,
+        }
+
+# ---------- Inference Runner ----------
+def run_inference(
+    data_csv: str,
+    ckpt_path: str,
+    sd3_model: str,
+    outdir: str,
+    size_h: int,
+    size_w: int,
+    steps: int,
+    batch_size: int,
+    seed: int,
+    dtype_str: str,
+    invert_mask: bool,
+    save_panel: bool,
+    save_concat: bool,
+    save_left: bool,
+    hf_token: str = None,
+):
+    os.makedirs(outdir, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    mp2dtype = {"fp16": torch.float16, "fp32": torch.float32, "bf16": torch.bfloat16}
+    dtype = mp2dtype.get(dtype_str, torch.float16)
+
+    seed_everything(seed)
+
+    # Download/read SD3.5
+    local_dir = snapshot_download(
+        repo_id=sd3_model, token=hf_token, revision=None,
+        resume_download=True, local_files_only=False
+    )
+
+    pipe = StableDiffusion3Pipeline.from_pretrained(
+        local_dir, torch_dtype=dtype, local_files_only=True, use_safetensors=True,
+    ).to(device)
+
+    # Enable mem-efficient attn in eval if available
+    try:
+        pipe.transformer.enable_xformers_memory_efficient_attention()
+    except Exception:
+        pass
+
+    vae = pipe.vae
+    transformer: SD3Transformer2DModel = pipe.transformer
+    encode_prompt = pipe.encode_prompt
+    scheduler: FlowMatchEulerDiscreteScheduler = FlowMatchEulerDiscreteScheduler.from_config(pipe.scheduler.config)
+
+    # Build projector & load ckpt
+    projector = ConcatProjector(in_ch=33, out_ch=16).to(device, dtype=torch.float32)  # keep FP32 like train
+    # Load weights
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"ckpt not found: {ckpt_path}")
+    payload = torch.load(ckpt_path, map_location="cpu")
+    msg_missing, msg_unexp = transformer.load_state_dict(payload["transformer"], strict=False)
+    proj_missing, proj_unexp = projector.load_state_dict(payload["projector"], strict=False)
+    print(f"[load] transformer missing={len(msg_missing)} unexpected={len(msg_unexp)}")
+    print(f"[load] projector   missing={len(proj_missing)} unexpected={len(proj_unexp)}")
+
+    transformer.eval()
+    projector.eval()
+
+    # Dataset & Loader
+    dataset = CSVVitonDataset(data_csv, size_h=size_h, size_w=size_w, invert_mask=invert_mask)
+    loader = torch.utils.data.DataLoader(
+        dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True, drop_last=False
+    )
+
+    # Prompt embeds (empty) helper
+    def _encode_prompts(bsz: int):
+        empties = [""] * bsz
+        try:
+            pe, _, ppe, _ = encode_prompt(
+                prompt=empties, prompt_2=empties, prompt_3=empties,
+                device=device, num_images_per_prompt=1, do_classifier_free_guidance=False,
+            )
+        except TypeError:
+            pe, _, ppe, _ = encode_prompt(
+                prompt=empties, device=device, num_images_per_prompt=1, do_classifier_free_guidance=False,
+            )
+        return pe.to(dtype), ppe.to(dtype)
+
+    # Generator for stable noise
+    gen = torch.Generator(device=device).manual_seed(seed)
+
+    with torch.no_grad():
+        for bi, batch in enumerate(loader):
+            x_p = batch["x_p"].to(device)               # [-1,1]
+            x_g = batch["x_g"].to(device)
+            m   = batch["m"].to(device)
+            x_in= batch["x_concat_in"].to(device, dtype)  # [-1,1]
+
+            B, _, H, WW = x_in.shape
+            W = WW // 2
+
+            # Latents & mask downsample
+            Xi = to_latent_sd3(vae, x_in).to(dtype)                    # [B,16,H/8,2W/8]
+            Mi = F.interpolate(m, size=(H // 8, (2 * W) // 8), mode="nearest").to(dtype)
+
+            # Sampler setup
+            scheduler.set_timesteps(steps, device=device)
+            sigma0 = float(getattr(scheduler, "init_noise_sigma",
+                                   scheduler.sigmas[0] if hasattr(scheduler, "sigmas") else 1.0))
+            z = torch.randn_like(Xi, generator=gen, dtype=torch.float32, device=device) * sigma0
+            z = z.to(dtype)
+
+            prompt_embeds, pooled = _encode_prompts(B)
+
+            for t in scheduler.timesteps:
+                t1d = _as_1d_timesteps(scheduler, z, t, B)
+                z_in  = _scale_model_input_safe(scheduler, z,  t1d)
+                Xi_in = _scale_model_input_safe(scheduler, Xi.float(), t1d)
+
+                hidden = torch.cat([z_in.float(), Xi_in, Mi.float()], dim=1)
+                hidden = torch.nan_to_num(hidden, nan=0.0, posinf=30.0, neginf=-30.0).clamp_(-30.0, 30.0)
+
+                proj = projector(hidden).to(dtype)
+                with torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=(device.type == 'cuda')):
+                    v = transformer(
+                        hidden_states=proj,
+                        timestep=t1d,
+                        encoder_hidden_states=prompt_embeds,
+                        pooled_projections=pooled,
+                        return_dict=True,
+                    ).sample
+
+                z = scheduler.step(v, t, z).prev_sample
+
+            x_hat = from_latent_sd3(vae, z)        # [-1,1], shape [B,3,H,2W]
+            x_hat01 = _denorm01(x_hat)             # [0,1]
+
+            # Saves
+            for i in range(B):
+                base = os.path.splitext(os.path.basename(batch["paths"]["person"][i]))[0]
+                # concat prediction
+                if save_concat:
+                    out_concat_path = os.path.join(outdir, f"{base}_pred_concat.png")
+                    save_image(x_hat01[i], out_concat_path)
+
+                # left-half (try-on) crop
+                if save_left:
+                    left = x_hat01[i, :, :, :W]
+                    out_left_path = os.path.join(outdir, f"{base}_tryon.png")
+                    save_image(left, out_left_path)
+
+                # optional panel
+                if save_panel:
+                    person = _denorm01(x_p[i])
+                    garment = _denorm01(x_g[i])
+                    mask_vis = m[i].repeat(3, 1, 1)
+                    masked_person = person * mask_vis
+                    concat_in = _denorm01(x_in[i])
+
+                    tiles = [
+                        person, mask_vis, masked_person,
+                        garment, concat_in, x_hat01[i]
+                    ]
+                    row = torch.cat(tiles, dim=2)
+                    grid = make_grid(row, nrow=1)
+                    out_panel_path = os.path.join(outdir, f"{base}_panel.png")
+                    save_image(grid, out_panel_path)
+
+            print(f"[{bi+1}/{len(loader)}] saved batch")
+
+# ---------- CLI ----------
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--data_csv", type=str, required=True,
+                   help="CSV path with headers: image, cloth, agnostic-mask")
+    p.add_argument("--ckpt", type=str, required=True,
+                   help="Checkpoint path, e.g., logs/.../[Train]_[120]_[0.1961].ckpt")
+    p.add_argument("--sd3_model", type=str, default="stabilityai/stable-diffusion-3.5-large")
+    p.add_argument("--outdir", type=str, default="infer_out")
+    p.add_argument("--size_h", type=int, default=512)
+    p.add_argument("--size_w", type=int, default=384)
+    p.add_argument("--steps", type=int, default=16)
+    p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--mixed_precision", type=str, default="fp16", choices=["fp16", "bf16", "fp32"])
+    p.add_argument("--invert_mask", action="store_true", help="Invert keep-mask if dataset uses cloth region=white")
+    p.add_argument("--save_panel", action="store_true")
+    p.add_argument("--no_save_concat", action="store_true")
+    p.add_argument("--no_save_left", action="store_true")
+    p.add_argument("--hf_token", type=str, default=None)
+    return p.parse_args()
+
 def main():
     args = parse_args()
-    # Pipeline
-    pipeline = CatVTONPipeline(
-        attn_ckpt_version=args.dataset_name,
-        attn_ckpt=args.resume_path,
-        base_ckpt=args.base_model_path,
-        weight_dtype={
-            "no": torch.float32,
-            "fp16": torch.float16,
-            "bf16": torch.bfloat16,
-        }[args.mixed_precision],
-        device="cuda",
-        skip_safety_check=True
-    )
-    # Dataset
-    if args.dataset_name == "vitonhd":
-        dataset = VITONHDTestDataset(args)
-    elif args.dataset_name == "dresscode":
-        dataset = DressCodeTestDataset(args)
-    else:
-        raise ValueError(f"Invalid dataset name {args.dataset}.")
-    print(f"Dataset {args.dataset_name} loaded, total {len(dataset)} pairs.")
-    dataloader = DataLoader(
-        dataset,
+    run_inference(
+        data_csv=args.data_csv,
+        ckpt_path=args.ckpt,
+        sd3_model=args.sd3_model,
+        outdir=args.outdir,
+        size_h=args.size_h,
+        size_w=args.size_w,
+        steps=args.steps,
         batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.dataloader_num_workers
+        seed=args.seed,
+        dtype_str=args.mixed_precision,
+        invert_mask=args.invert_mask,
+        save_panel=args.save_panel,
+        save_concat=(not args.no_save_concat),
+        save_left=(not args.no_save_left),
+        hf_token=args.hf_token,
     )
-    # Inference
-    generator = torch.Generator(device='cuda').manual_seed(args.seed)
-    args.output_dir = os.path.join(args.output_dir, f"{args.dataset_name}-{args.height}", "paired" if args.eval_pair else "unpaired")
-    if not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir)
-    for batch in tqdm(dataloader):
-        person_images = batch['person']
-        cloth_images = batch['cloth']
-        masks = batch['mask']
-        results = pipeline(
-            person_images,
-            cloth_images,
-            masks,
-            num_inference_steps=args.num_inference_steps,
-            guidance_scale=args.guidance_scale,
-            height=args.height,
-            width=args.width,
-            generator=generator,
-        )
-        
-        if args.concat_eval_results or args.repaint:
-            person_images = to_pil_image(person_images)
-            cloth_images = to_pil_image(cloth_images)
-            masks = to_pil_image(masks)
-        for i, result in enumerate(results):
-            person_name = batch['person_name'][i]
-            output_path = os.path.join(args.output_dir, person_name)
-            if not os.path.exists(os.path.dirname(output_path)):
-                os.makedirs(os.path.dirname(output_path))
-            if args.repaint:
-                person_path, mask_path = dataset.data[batch['index'][i]]['person'], dataset.data[batch['index'][i]]['mask']
-                person_image= Image.open(person_path).resize(result.size, Image.LANCZOS)
-                mask = Image.open(mask_path).resize(result.size, Image.NEAREST)
-                result = repaint(person_image, mask, result)
-            if args.concat_eval_results:
-                w, h = result.size
-                concated_result = Image.new('RGB', (w*3, h))
-                concated_result.paste(person_images[i], (0, 0))
-                concated_result.paste(cloth_images[i], (w, 0))  
-                concated_result.paste(result, (w*2, 0))
-                result = concated_result
-            result.save(output_path)
 
 if __name__ == "__main__":
     main()
