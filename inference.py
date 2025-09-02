@@ -24,6 +24,7 @@ except Exception as e:
     ) from e
 
 from huggingface_hub import snapshot_download
+from tqdm import tqdm
 
 # ---------- Utils (same as train) ----------
 def seed_everything(seed: int):
@@ -108,7 +109,7 @@ def _denorm01(x: torch.Tensor) -> torch.Tensor:
 
 # ---------- Dataset for CSV (image, cloth, agnostic-mask) ----------
 class CSVVitonDataset(torch.utils.data.Dataset):
-    def __init__(self, csv_path: str, size_h: int, size_w: int, invert_mask: bool = False):
+    def __init__(self, csv_path: str, size_h: int, size_w: int, invert_mask: bool = True):
         super().__init__()
         self.items: List[Dict[str, str]] = []
         with open(csv_path, "r", newline="") as f:
@@ -167,12 +168,29 @@ def run_inference(
     save_concat: bool,
     save_left: bool,
     hf_token: str = None,
+    device_pref: str = "auto",
 ):
     os.makedirs(outdir, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # Resolve device from user preference
+    device_pref = device_pref.lower()
+    if device_pref not in {"auto", "cuda", "cpu"}:
+        raise ValueError(f"Invalid --device '{device_pref}'. Choose from auto|cuda|cpu.")
+    if device_pref == "cuda":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif device_pref == "cpu":
+        device = torch.device("cpu")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Mixed precision selection with CPU guard
     mp2dtype = {"fp16": torch.float16, "fp32": torch.float32, "bf16": torch.bfloat16}
     dtype = mp2dtype.get(dtype_str, torch.float16)
+
+    if device.type == "cpu":
+        if dtype != torch.float32:
+            print("[warn] CPU detected → forcing mixed_precision=fp32 for compatibility.")
+        dtype = torch.float32
 
     seed_everything(seed)
 
@@ -186,11 +204,13 @@ def run_inference(
         local_dir, torch_dtype=dtype, local_files_only=True, use_safetensors=True,
     ).to(device)
 
-    # Enable mem-efficient attn in eval if available
-    try:
-        pipe.transformer.enable_xformers_memory_efficient_attention()
-    except Exception:
-        pass
+    # Enable mem-efficient attn in eval if available (CUDA only)
+    if device.type == "cuda":
+        try:
+            pipe.transformer.enable_xformers_memory_efficient_attention()
+            print("[info] xFormers memory-efficient attention enabled.")
+        except Exception:
+            print("[info] xFormers not available; using standard attention.")
 
     vae = pipe.vae
     transformer: SD3Transformer2DModel = pipe.transformer
@@ -214,7 +234,12 @@ def run_inference(
     # Dataset & Loader
     dataset = CSVVitonDataset(data_csv, size_h=size_h, size_w=size_w, invert_mask=invert_mask)
     loader = torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True, drop_last=False
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=(device.type == "cuda"),
+        drop_last=False
     )
 
     # Prompt embeds (empty) helper
@@ -235,7 +260,9 @@ def run_inference(
     gen = torch.Generator(device=device).manual_seed(seed)
 
     with torch.no_grad():
-        for bi, batch in enumerate(loader):
+        # 배치 진행률 바
+        pbar_batches = tqdm(loader, desc="Batches", ncols=120)
+        for bi, batch in enumerate(pbar_batches):
             x_p = batch["x_p"].to(device)               # [-1,1]
             x_g = batch["x_g"].to(device)
             m   = batch["m"].to(device)
@@ -244,20 +271,27 @@ def run_inference(
             B, _, H, WW = x_in.shape
             W = WW // 2
 
+            assert m.shape[-1] == W, f"mask width ({m.shape[-1]}) must equal person width W ({W})."
+            m_concat = torch.cat([m, torch.zeros_like(m)], dim=2)  # [B,1,H,2W]
+
             # Latents & mask downsample
             Xi = to_latent_sd3(vae, x_in).to(dtype)                    # [B,16,H/8,2W/8]
-            Mi = F.interpolate(m, size=(H // 8, (2 * W) // 8), mode="nearest").to(dtype)
+            #Mi = F.interpolate(m, size=(H // 8, (2 * W) // 8), mode="nearest").to(dtype)
+            Mi = F.interpolate(m_concat, size=(H // 8, (2 * W) // 8), mode="nearest").to(dtype)
 
             # Sampler setup
             scheduler.set_timesteps(steps, device=device)
             sigma0 = float(getattr(scheduler, "init_noise_sigma",
                                    scheduler.sigmas[0] if hasattr(scheduler, "sigmas") else 1.0))
-            z = torch.randn_like(Xi, generator=gen, dtype=torch.float32, device=device) * sigma0
+            z = torch.randn(Xi.shape, generator=gen, dtype=torch.float32, device=device) * sigma0
             z = z.to(dtype)
 
             prompt_embeds, pooled = _encode_prompts(B)
 
-            for t in scheduler.timesteps:
+            # 스텝 진행률 바 (배치마다 새로)
+            pbar_steps = tqdm(scheduler.timesteps, total=len(scheduler.timesteps),
+                              desc=f"Sampling b{bi}", ncols=120, leave=False)
+            for t in pbar_steps:
                 t1d = _as_1d_timesteps(scheduler, z, t, B)
                 z_in  = _scale_model_input_safe(scheduler, z,  t1d)
                 Xi_in = _scale_model_input_safe(scheduler, Xi.float(), t1d)
@@ -266,7 +300,16 @@ def run_inference(
                 hidden = torch.nan_to_num(hidden, nan=0.0, posinf=30.0, neginf=-30.0).clamp_(-30.0, 30.0)
 
                 proj = projector(hidden).to(dtype)
-                with torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=(device.type == 'cuda')):
+                if device.type == "cuda":
+                    with torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=True):
+                        v = transformer(
+                            hidden_states=proj,
+                            timestep=t1d,
+                            encoder_hidden_states=prompt_embeds,
+                            pooled_projections=pooled,
+                            return_dict=True,
+                        ).sample
+                else:
                     v = transformer(
                         hidden_states=proj,
                         timestep=t1d,
@@ -333,6 +376,8 @@ def parse_args():
     p.add_argument("--no_save_concat", action="store_true")
     p.add_argument("--no_save_left", action="store_true")
     p.add_argument("--hf_token", type=str, default=None)
+    p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"],
+                   help="Select device. 'auto' uses CUDA if available, else CPU.")
     return p.parse_args()
 
 def main():
@@ -353,6 +398,7 @@ def main():
         save_concat=(not args.no_save_concat),
         save_left=(not args.no_save_left),
         hf_token=args.hf_token,
+        device_pref=args.device,
     )
 
 if __name__ == "__main__":
