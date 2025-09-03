@@ -10,3 +10,4 @@ torchrun --standalone --nnodes=1 --nproc_per_node=2 ddp_train_without_crossattn.
  --save_name ddp \
  --cond_dropout_p 0.1 \
  --no_prefer_xformers \
+ --resume_ckpt logs/20250903_111416_ddp/models/epoch_15_loss_0.7013.ckpt
