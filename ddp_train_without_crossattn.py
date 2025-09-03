@@ -632,21 +632,43 @@ class CatVTON_SD3_Trainer:
         self._preview_gen = torch.Generator(device=self.device).manual_seed(cfg.preview_seed)
 
     def _encode_prompts(self, bsz: int):
+        empties = [""] * bsz
+
+        # 1) 텍스트 끌 때: 한 번만 shape probe -> zero 텐서 생성
         if getattr(self.cfg, "disable_text", True):
             if not hasattr(self, "_enc_shapes"):
                 with torch.no_grad():
-                    pe_probe, _, ppe_probe, _ = self.encode_prompt(
-                        prompt=[""], device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False,
-                    )
-                self._enc_shapes = (pe_probe.shape[1:], ppe_probe.shape[1:])  # (seq, dim), (dim,)
-            (seq, dim) = self._enc_shapes[0]
-            pe  = torch.zeros((bsz, seq, dim), dtype=self.dtype, device=self.device)
-            ppe = torch.zeros((bsz, self._enc_shapes[1][0]), dtype=self.dtype, device=self.device)
+                    try:
+                        # SD3.x(3-프롬프트) 우선
+                        pe_probe, _, ppe_probe, _ = self.encode_prompt(
+                            prompt=[""], prompt_2=[""], prompt_3=[""],
+                            device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False,
+                        )
+                    except TypeError:
+                        # 구버전(1-프롬프트) 폴백
+                        pe_probe, _, ppe_probe, _ = self.encode_prompt(
+                            prompt=[""],
+                            device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False,
+                        )
+                # pe: (B, seq, dim), ppe: (B, dim)
+                self._pe_seq = pe_probe.shape[1]
+                self._pe_dim = pe_probe.shape[2]
+                self._ppe_dim = ppe_probe.shape[1]
+            pe  = torch.zeros((bsz, self._pe_seq,  self._pe_dim),  dtype=self.dtype, device=self.device)
+            ppe = torch.zeros((bsz, self._ppe_dim),                dtype=self.dtype, device=self.device)
             return pe, ppe
-        # 텍스트 쓸 때만 실제 인코딩
-        pe, _, ppe, _ = self.encode_prompt(
-            prompt=[""] * bsz, device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False,
-        )
+
+        # 2) 텍스트 쓸 때: 실제 인코딩 (3-프롬프트 -> 1-프롬프트 폴백)
+        try:
+            pe, _, ppe, _ = self.encode_prompt(
+                prompt=empties, prompt_2=empties, prompt_3=empties,
+                device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False,
+            )
+        except TypeError:
+            pe, _, ppe, _ = self.encode_prompt(
+                prompt=empties,
+                device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False,
+            )
         return pe.to(self.dtype), ppe.to(self.dtype)
 
     def _denorm(self, x: torch.Tensor) -> torch.Tensor:
