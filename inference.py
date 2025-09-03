@@ -1,5 +1,6 @@
 # inference.py — FlowMatch-correct SD3.5 inference for CatVTON
 import os
+import re
 import csv
 import json
 import argparse
@@ -109,7 +110,7 @@ def _denorm01(x: torch.Tensor) -> torch.Tensor:
 
 # ---------- Dataset for CSV (image, cloth, agnostic-mask) ----------
 class CSVVitonDataset(torch.utils.data.Dataset):
-    def __init__(self, csv_path: str, size_h: int, size_w: int, invert_mask: bool = True):
+    def __init__(self, csv_path: str, size_h: int, size_w: int, invert_mask: bool = False):
         super().__init__()
         self.items: List[Dict[str, str]] = []
         with open(csv_path, "r", newline="") as f:
@@ -151,6 +152,31 @@ class CSVVitonDataset(torch.utils.data.Dataset):
             "paths": meta,
         }
 
+# ---------- helpers ----------
+def _cfg_get(cfg, key, default=None):
+    """Works with OmegaConf/FrozenDict/dict/attrs."""
+    try:
+        return getattr(cfg, key)
+    except Exception:
+        pass
+    try:
+        return cfg.get(key, default)
+    except Exception:
+        pass
+    try:
+        return cfg[key]
+    except Exception:
+        return default
+
+def _derive_subdir_from_ckpt(ckpt_path: str) -> str:
+    """
+    Take .../<RUN_DIR>/models/<file.ckpt>  ->  extract 'YYYYMMDD_HHMMSS' if present
+    else fallback to basename(<RUN_DIR>).
+    """
+    parent2 = os.path.basename(os.path.dirname(os.path.dirname(ckpt_path)))  # run dir name (e.g., 20250830_151751_ddp)
+    m = re.search(r"(\d{8}_\d{6})", parent2)
+    return m.group(1) if m else parent2
+
 # ---------- Inference Runner ----------
 def run_inference(
     data_csv: str,
@@ -169,8 +195,16 @@ def run_inference(
     save_left: bool,
     hf_token: str = None,
     device_pref: str = "auto",
+    out_sub_from_ckpt: bool = True,   # NEW: nest under OUTDIR/<run_stamp>/
 ):
     os.makedirs(outdir, exist_ok=True)
+
+    # If requested, nest outputs in OUTDIR/<run_stamp> derived from ckpt
+    if out_sub_from_ckpt:
+        sub = _derive_subdir_from_ckpt(ckpt_path)
+        outdir = os.path.join(outdir, sub)
+        os.makedirs(outdir, exist_ok=True)
+        print(f"[out] saving to {outdir}")
 
     # Resolve device from user preference
     device_pref = device_pref.lower()
@@ -186,7 +220,6 @@ def run_inference(
     # Mixed precision selection with CPU guard
     mp2dtype = {"fp16": torch.float16, "fp32": torch.float32, "bf16": torch.bfloat16}
     dtype = mp2dtype.get(dtype_str, torch.float16)
-
     if device.type == "cpu":
         if dtype != torch.float32:
             print("[warn] CPU detected → forcing mixed_precision=fp32 for compatibility.")
@@ -210,22 +243,42 @@ def run_inference(
             pipe.transformer.enable_xformers_memory_efficient_attention()
             print("[info] xFormers memory-efficient attention enabled.")
         except Exception:
-            print("[info] xFormers not available; using standard attention.")
+            print("[info] xFormers not available; using standard attention.]")
 
     vae = pipe.vae
     transformer: SD3Transformer2DModel = pipe.transformer
     encode_prompt = pipe.encode_prompt
-    scheduler: FlowMatchEulerDiscreteScheduler = FlowMatchEulerDiscreteScheduler.from_config(pipe.scheduler.config)
 
-    # Build projector & load ckpt
-    projector = ConcatProjector(in_ch=33, out_ch=16).to(device, dtype=torch.float32)  # keep FP32 like train
-    # Load weights
+    # ---------- load ckpt & restore scheduler config if present ----------
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"ckpt not found: {ckpt_path}")
-    payload = torch.load(ckpt_path, map_location="cpu")
+    try:
+        payload = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    except TypeError:
+        payload = torch.load(ckpt_path, map_location="cpu")
+
+    sched_cfg = payload.get("scheduler_config", None)
+    if sched_cfg is not None:
+        scheduler: FlowMatchEulerDiscreteScheduler = FlowMatchEulerDiscreteScheduler.from_config(sched_cfg)
+        print("[sched] restored from ckpt scheduler_config")
+    else:
+        scheduler: FlowMatchEulerDiscreteScheduler = FlowMatchEulerDiscreteScheduler.from_config(pipe.scheduler.config)
+        print("[sched] using scheduler from pipeline (no scheduler_config in ckpt)")
+
+    # Ensure prediction_type is v_prediction (as in training)
+    pred_type = _cfg_get(scheduler.config, "prediction_type", None)
+    print("[debug] scheduler.prediction_type =", pred_type)
+    if pred_type != "v_prediction":
+        print("[fix] overriding scheduler.prediction_type -> v_prediction")
+        scheduler.register_to_config(prediction_type="v_prediction")
+        print("[debug] scheduler.prediction_type (after) =", _cfg_get(scheduler.config, "prediction_type"))
+
+    # ---------- Load model weights ----------
     msg_missing, msg_unexp = transformer.load_state_dict(payload["transformer"], strict=False)
-    proj_missing, proj_unexp = projector.load_state_dict(payload["projector"], strict=False)
     print(f"[load] transformer missing={len(msg_missing)} unexpected={len(msg_unexp)}")
+
+    projector = ConcatProjector(in_ch=33, out_ch=16).to(device, dtype=torch.float32)  # keep FP32 like train
+    proj_missing, proj_unexp = projector.load_state_dict(payload["projector"], strict=False)
     print(f"[load] projector   missing={len(proj_missing)} unexpected={len(proj_unexp)}")
 
     transformer.eval()
@@ -260,7 +313,6 @@ def run_inference(
     gen = torch.Generator(device=device).manual_seed(seed)
 
     with torch.no_grad():
-        # 배치 진행률 바
         pbar_batches = tqdm(loader, desc="Batches", ncols=120)
         for bi, batch in enumerate(pbar_batches):
             x_p = batch["x_p"].to(device)               # [-1,1]
@@ -276,7 +328,6 @@ def run_inference(
 
             # Latents & mask downsample
             Xi = to_latent_sd3(vae, x_in).to(dtype)                    # [B,16,H/8,2W/8]
-            #Mi = F.interpolate(m, size=(H // 8, (2 * W) // 8), mode="nearest").to(dtype)
             Mi = F.interpolate(m_concat, size=(H // 8, (2 * W) // 8), mode="nearest").to(dtype)
 
             # Sampler setup
@@ -288,7 +339,7 @@ def run_inference(
 
             prompt_embeds, pooled = _encode_prompts(B)
 
-            # 스텝 진행률 바 (배치마다 새로)
+            # Per-step loop
             pbar_steps = tqdm(scheduler.timesteps, total=len(scheduler.timesteps),
                               desc=f"Sampling b{bi}", ncols=120, leave=False)
             for t in pbar_steps:
@@ -378,6 +429,8 @@ def parse_args():
     p.add_argument("--hf_token", type=str, default=None)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"],
                    help="Select device. 'auto' uses CUDA if available, else CPU.")
+    p.add_argument("--out_sub_from_ckpt", action="store_true",
+                   help="Nest outputs under OUTDIR/<YYYYMMDD_HHMMSS> derived from CKPT path.")
     return p.parse_args()
 
 def main():
@@ -399,6 +452,7 @@ def main():
         save_left=(not args.no_save_left),
         hf_token=args.hf_token,
         device_pref=args.device,
+        out_sub_from_ckpt=args.out_sub_from_ckpt or True,  # default on
     )
 
 if __name__ == "__main__":

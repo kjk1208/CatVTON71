@@ -6,7 +6,7 @@ size_w: 384
 mask_based: true          # Stage-1은 true, Stage-2는 false
 invert_mask: true         # 의류 마스크 반대로 적용
 lr: 1.0e-5
-batch_size: 8
+batch_size: 20
 grad_accum: 1
 max_steps: 256000         # 16000
 cond_dropout_p: 0.1
@@ -16,6 +16,7 @@ num_workers: 8
 preview_infer_steps : 16
 preview_seed : 1234
 save_epoch_ckpt : 15
+disable_text : true
 
 # logging
 save_root_dir: logs

@@ -13,13 +13,14 @@ SIZE_W=${SIZE_W:-384}
 STEPS=${STEPS:-16}
 BS=${BS:-32}
 SEED=${SEED:-1234}
-MIXED_PRECISION=${MIXED_PRECISION:-"fp16"}   # fp16 | bf16 | fp32
+MIXED_PRECISION=${MIXED_PRECISION:-"bf16"}   # fp16 | bf16 | fp32
 INVERT_MASK=${INVERT_MASK:-1}                # 1 to invert
-SAVE_PANEL=${SAVE_PANEL:-0}                  # 1 to save panels
+SAVE_PANEL=${SAVE_PANEL:-1}                  # 1 to save panels
 NO_SAVE_CONCAT=${NO_SAVE_CONCAT:-0}          # 1 to skip saving concat
 NO_SAVE_LEFT=${NO_SAVE_LEFT:-0}              # 1 to skip left-half
 HF_TOKEN=${HF_TOKEN:-""}                     # if needed for gated repo
-DEVICE=${DEVICE:-"cpu"}                     # auto | cuda | cpu
+DEVICE=${DEVICE:-"cuda"}                      # auto | cuda | cpu
+OUT_SUB_FROM_CKPT=${OUT_SUB_FROM_CKPT:-1}    # 1 -> save under OUTDIR/<YYYYMMDD_HHMMSS>
 
 # If CPU is requested, force fp32 for compatibility
 if [[ "$DEVICE" == "cpu" ]]; then
@@ -32,6 +33,7 @@ EXTRA_ARGS=()
 [[ "$NO_SAVE_CONCAT" == "1" ]] && EXTRA_ARGS+=("--no_save_concat")
 [[ "$NO_SAVE_LEFT" == "1" ]] && EXTRA_ARGS+=("--no_save_left")
 [[ -n "$HF_TOKEN" ]] && EXTRA_ARGS+=("--hf_token" "$HF_TOKEN")
+[[ "$OUT_SUB_FROM_CKPT" == "1" ]] && EXTRA_ARGS+=("--out_sub_from_ckpt")
 EXTRA_ARGS+=("--device" "$DEVICE")
 
 python inference.py \

@@ -36,3 +36,5 @@ hf_transfer>=0.1.6
 protobuf==4.25.3
 sentencepiece>=0.1.99
 tensorboard
+xformer==0.0.32
+-f https://download.pytorch.org/whl/cu121

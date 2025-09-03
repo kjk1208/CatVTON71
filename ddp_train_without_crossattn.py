@@ -1,5 +1,12 @@
-# ddp_train_patched.py — SD3.5 CatVTON (DDP-ready) with train/infer sched split, v-pred, tighter attn-freeze, left-half loss weighting, and clearer logging
+# ddp_train_patched.py — SD3.5 CatVTON (DDP-ready)
+# - train/infer scheduler split (DDPM train, FlowMatch Euler infer) with v-pred
+# - cross-attention fully stripped (ZeroCrossAttn + text embeds zeroed)
+# - freeze only self-attn Q/K/V/Out (no FFN/norm/cross) — robust module-walk
+# - prefer xFormers; fallback to PyTorch SDPA (AttnProcessor2_0)
+# - left-half loss weighting & clearer logging
+
 import os
+import re
 import json
 import random
 import argparse
@@ -37,6 +44,13 @@ try:
 except Exception:
     pass
 
+# (Optional) You can remove this block if the FutureWarning is noisy on your PyTorch.
+# It's harmless to leave; PyTorch just recommends a newer API.
+try:
+    torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False)
+except Exception:
+    pass
+
 # ------------------------------------------------------------
 # Diffusers (SD3.5 / SD3)
 # ------------------------------------------------------------
@@ -53,9 +67,21 @@ try:
     # ✅ train/infer scheduler split
     from diffusers.schedulers import FlowMatchEulerDiscreteScheduler, DDPMScheduler
 except Exception as e:
-    raise ImportError(
-        "Schedulers not found. Please update diffusers (>=0.34)."
-    ) from e
+    raise ImportError("Schedulers not found. Please update diffusers (>=0.34).") from e
+
+# attention processors
+try:
+    from diffusers.models.attention_processor import (
+        AttnProcessor,
+        AttnProcessor2_0,   # SDPA
+        XFormersAttnProcessor,  # xFormers
+    )
+    _HAS_ATTENTION_PROCESSORS = True
+except Exception:
+    _HAS_ATTENTION_PROCESSORS = False
+    AttnProcessor = object
+    AttnProcessor2_0 = object
+    XFormersAttnProcessor = object
 
 from huggingface_hub import snapshot_download
 
@@ -134,6 +160,23 @@ class NoopWriter:
 
 def ddp_state_dict(m: nn.Module):
     return m.module.state_dict() if isinstance(m, DDP) else m.state_dict()
+
+# === DEBUG: trainable 파라미터 요약 출력 ===
+def _debug_print_trainables(mod: nn.Module, tag: str, max_items: int = 10):
+    total = sum(p.numel() for p in mod.parameters())
+    train = sum(p.numel() for p in mod.parameters() if p.requires_grad)
+    print(f"[trainables/{tag}] total={total/1e6:.2f}M, trainable={train/1e6:.2f}M")
+
+    from collections import Counter
+    bucket = Counter()
+    for n, p in mod.named_parameters():
+        if p.requires_grad:
+            head = ".".join(n.split(".")[:3])  # 상위 2~3단계만 묶어서 보기
+            bucket[head] += p.numel()
+
+    top = bucket.most_common(max_items)
+    if top:
+        print(f"[trainables/{tag}] top{max_items}:", [(k, f"{v/1e6:.2f}M") for k, v in top])
 
 
 # ------------------------------------------------------------
@@ -231,24 +274,147 @@ class ConcatProjector(nn.Module):
         return self.net(x)
 
 
-def freeze_all_but_attn_sd3(transformer: SD3Transformer2DModel):
-    """Freeze everything then unfreeze self-attention only (exclude cross-attn)."""
+# ------------------------------------------------------------
+# Freezing & attention processors
+# ------------------------------------------------------------
+def freeze_all_but_self_attn_qkv(transformer: SD3Transformer2DModel):
+    """
+    Freeze everything; unfreeze ONLY self-attn Q/K/V/Out weights.
+    We detect attention blocks by presence of to_q/to_k/to_v/to_out and
+    treat names containing ('attn2','cross','encoder') as cross-attn.
+    """
+    # 1) freeze all
     for p in transformer.parameters():
         p.requires_grad = False
 
-    allow_keys = ("attn", "to_q", "to_k", "to_v", "to_out")   # broad allow
-    exclude_keys = ("attn2", "cross")                         # common cross-attn tokens
-    matched = []
-    for name, module in transformer.named_modules():
-        if any(k in name for k in allow_keys) and not any(ek in name for ek in exclude_keys):
-            for p in module.parameters():
-                p.requires_grad = True
-            matched.append(name)
+    deny_tokens = ("attn2", "cross", "encoder")
+    kept = []
 
-    real_trainable = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
-    if real_trainable == 0:
-        raise RuntimeError("No transformer params were unfrozen. Check patterns.")
-    return real_trainable, matched
+    # 2) walk modules and selectively unfreeze Q/K/V/Out of self-attn only
+    for name, module in transformer.named_modules():
+        has_qkv = all(hasattr(module, attr) for attr in ("to_q", "to_k", "to_v", "to_out"))
+        if not has_qkv:
+            continue
+        if any(tok in name for tok in deny_tokens):
+            continue  # skip cross-attn
+
+        # unfreeze params inside to_q/to_k/to_v/to_out
+        for subn in ("to_q", "to_k", "to_v", "to_out"):
+            subm = getattr(module, subn, None)
+            if subm is None:
+                continue
+            for pn, p in subm.named_parameters(recurse=True):
+                p.requires_grad = True
+                if len(kept) < 16:
+                    kept.append(f"{name}.{subn}.{pn}")
+
+    trainable = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
+    if trainable == 0:
+        raise RuntimeError("No params unfrozen; check patterns.")
+    return trainable, kept
+
+
+class ZeroCrossAttnProcessor(AttnProcessor):
+    """Return zeros for cross-attn paths, matching shapes expected by SD3."""
+    def __call__(
+        self,
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        **kwargs,
+    ):
+        # self_out zeros like hidden_states
+        self_zero = torch.zeros_like(hidden_states)
+        # VERY IMPORTANT: context_out zeros MUST match encoder_hidden_states shape (when present)
+        ref = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
+        ctx_zero = torch.zeros_like(ref)
+        return self_zero, ctx_zero
+
+
+# ===== SD3-safe wrappers: ALWAYS return exactly (self_out, ctx_out) and
+# ===== ensure ctx_out matches encoder_hidden_states' shape when provided.
+class SD3SafeAttnProcessorSDPA(AttnProcessor2_0):
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, **kwargs):
+        out = super().__call__(attn, hidden_states, encoder_hidden_states, attention_mask, **kwargs)
+        if isinstance(out, tuple):
+            if len(out) >= 2:
+                return out[0], out[1]
+            else:
+                ref = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
+                return out[0], torch.zeros_like(ref)
+        else:
+            ref = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
+            return out, torch.zeros_like(ref)
+
+
+try:
+    class SD3SafeAttnProcessorXFormers(XFormersAttnProcessor):
+        def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, **kwargs):
+            out = super().__call__(attn, hidden_states, encoder_hidden_states, attention_mask, **kwargs)
+            if isinstance(out, tuple):
+                if len(out) >= 2:
+                    return out[0], out[1]
+                else:
+                    ref = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
+                    return out[0], torch.zeros_like(ref)
+            else:
+                ref = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
+                return out, torch.zeros_like(ref)
+except Exception:
+    pass
+
+
+def apply_attention_processors(transformer: SD3Transformer2DModel, logger: logging.Logger, prefer_xformers: bool = True,
+                               zero_cross_attn: bool = True) -> str:
+    """
+    Prefer xFormers for self-attn, fallback to SDPA.
+    Optionally zero-out cross-attn by processor mapping.
+    Always make processors return exactly (self_out, ctx_out) to satisfy SD3 attention.forward.
+    """
+    if not _HAS_ATTENTION_PROCESSORS or not hasattr(transformer, "set_attn_processor"):
+        try:
+            if prefer_xformers:
+                transformer.enable_xformers_memory_efficient_attention()
+                return "xformers_via_enable()"
+        except Exception as e:
+            logger.info(f"[mem] xFormers not available via enable(): {e}")
+        return "default_attention"
+
+    try:
+        keys = list(transformer.attn_processors.keys())
+    except Exception:
+        keys = []
+
+    use_xformers = False
+    if prefer_xformers:
+        try:
+            _ = XFormersAttnProcessor
+            use_xformers = True
+        except Exception:
+            use_xformers = False
+
+    procs = {}
+    for k in keys:
+        is_cross = ("attn2" in k) or ("cross" in k) or ("encoder" in k)
+        if is_cross and zero_cross_attn:
+            procs[k] = ZeroCrossAttnProcessor()
+        else:
+            if use_xformers:
+                try:
+                    procs[k] = SD3SafeAttnProcessorXFormers()
+                except Exception:
+                    procs[k] = SD3SafeAttnProcessorSDPA()
+            else:
+                procs[k] = SD3SafeAttnProcessorSDPA()
+
+    if procs:
+        transformer.set_attn_processor(procs)
+        return ("xformers+zero_cross" if use_xformers and zero_cross_attn
+                else "xformers" if use_xformers
+                else "sdpa+zero_cross" if zero_cross_attn
+                else "sdpa")
+    return "default_attention"
 
 
 # ------------------------------------------------------------
@@ -353,7 +519,7 @@ class CatVTON_SD3_Trainer:
         if self.is_main:
             self.logger.info(f"Loaded SD3 model: {cfg.sd3_model}")
 
-        # memory knobs (before DDP wrap)
+        # memory knobs (before DDP wrap) — gradient ckpt
         try:
             self.transformer.enable_gradient_checkpointing()
             msg = "[mem] gradient checkpointing ON"
@@ -363,21 +529,20 @@ class CatVTON_SD3_Trainer:
             msg = f"[mem] gradient checkpointing not available: {e}"
             if self.is_main: print(msg)
             self.logger.info(msg)
-        try:
-            self.transformer.enable_xformers_memory_efficient_attention()
-            msg = "[mem] xFormers attention ON"
-            if self.is_main: print(msg)
-            self.logger.info(msg)
-        except Exception as e:
-            msg = f"[mem] xFormers not available: {e}"
-            if self.is_main: print(msg)
-            self.logger.info(msg)
+
+        # >>> Attention processors: prefer xFormers, fallback SDPA, and zero cross-attn
+        attn_mode = apply_attention_processors(
+            self.transformer, self.logger,
+            prefer_xformers=cfg.prefer_xformers, zero_cross_attn=cfg.strip_cross_attention
+        )
+        if self.is_main:
+            self.logger.info(f"[mem] attention_backend={attn_mode}")
 
         # projector: keep FP32
         self.projector = ConcatProjector(in_ch=33, out_ch=16).to(self.device, dtype=torch.float32)
 
-        # freeze except attention (before DDP)
-        trainable_tf, matched_modules = freeze_all_but_attn_sd3(self.transformer)
+        # freeze except self-attn Q/K/V/Out (before DDP)
+        trainable_tf, keep_names_sample = freeze_all_but_self_attn_qkv(self.transformer)
 
         # cast trainable(attn) params to FP32 when using fp16 training
         casted = 0
@@ -392,10 +557,11 @@ class CatVTON_SD3_Trainer:
 
         proj_params = sum(p.numel() for p in self.projector.parameters())
         if self.is_main:
-            self.logger.info(f"[freeze] matched_modules={len(matched_modules)} (showing up to 8): "
-                             + ", ".join(matched_modules[:8]))
+            self.logger.info(f"[freeze] sample_trainable_params (up to 16): {', '.join(keep_names_sample)}")
             print(f"Trainable params (unique): transformer={trainable_tf/1e6:.2f}M, projector={proj_params/1e6:.4f}M")
             self.logger.info(f"Trainable params (unique): transformer={trainable_tf/1e6:.2f}M, projector={proj_params/1e6:.4f}M")
+            # === DEBUG 호출 (DDP 래핑 전에 실제로 무엇이 열려 있는지 확인) ===
+            _debug_print_trainables(self.transformer, "after_freeze_before_ddp")
 
         # data
         self.dataset = PairListDataset(
@@ -443,6 +609,12 @@ class CatVTON_SD3_Trainer:
             self.projector, device_ids=[self.local_rank], output_device=self.local_rank,
             broadcast_buffers=False, find_unused_parameters=False
         )
+        
+        # === DEBUG 호출 (DDP가 require_grad를 건드리지 않았는지 재확인) ===
+        if self.is_main:
+            _debug_print_trainables(self.transformer.module, "after_ddp")
+            # 필요하면 projector도 확인
+            # _debug_print_trainables(self.projector.module, "projector_after_ddp")
 
         # optimizer
         optim_params = itertools.chain(
@@ -460,6 +632,10 @@ class CatVTON_SD3_Trainer:
         self._preview_gen = torch.Generator(device=self.device).manual_seed(cfg.preview_seed)
 
     def _encode_prompts(self, bsz: int):
+        """
+        Always get correct shapes from encode_prompt, then zero them so they have no effect.
+        This avoids SD3's time_text_embed(None) crash but still disables conditioning.
+        """
         empties = [""] * bsz
         try:
             pe, _, ppe, _ = self.encode_prompt(
@@ -470,7 +646,9 @@ class CatVTON_SD3_Trainer:
             pe, _, ppe, _ = self.encode_prompt(
                 prompt=empties, device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False,
             )
-        return pe.to(self.dtype), ppe.to(self.dtype)
+        pe  = torch.zeros_like(pe,  dtype=self.dtype, device=self.device)
+        ppe = torch.zeros_like(ppe, dtype=self.dtype, device=self.device)
+        return pe, ppe
 
     def _denorm(self, x: torch.Tensor) -> torch.Tensor:
         return torch.clamp((x + 1.0) * 0.5, 0.0, 1.0)
@@ -652,7 +830,6 @@ class CatVTON_SD3_Trainer:
         out_f32 = out.float()
 
         # --------- Loss (emphasize left/try-on half using downsampled mask) ---------
-        # Mi: [B,1,h,2w]
         h, w = out_f32.shape[-2], out_f32.shape[-1]
         wmap = torch.ones((B, 1, h, w), device=out_f32.device, dtype=out_f32.dtype)
         left_bin = (Mi[:, :, :, :w] > 0).float()  # Mi already sized (h,2w); use left half only
@@ -823,10 +1000,15 @@ DEFAULTS = {
     "size_h": 512, "size_w": 384,
     "mask_based": True, "invert_mask": False,
 
-    # opt (aligned closer to paper: LR 1e-5, cond-dropout 0.1)
+    # opt (paper-like): constant LR 1e-5, light cond-dropout
     "lr": 1e-5, "batch_size": 4, "grad_accum": 1, "max_steps": 128000,
     "seed": 1337, "num_workers": 4, "cond_dropout_p": 0.1,
     "mixed_precision": "fp16", "loss_sigma_weight": False,
+
+    # attention/text prefs
+    "prefer_xformers": True,          # try xFormers first
+    "strip_cross_attention": True,    # zero cross-attn processors
+    "disable_text": True,             # (kept for clarity; we still zero embeds)
 
     # logging / save
     "save_root_dir": "logs", "save_name": "catvton_sd35",
@@ -866,6 +1048,14 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=None)
     p.add_argument("--hf_token", type=str, default=None)
 
+    # attention/text flags
+    p.add_argument("--prefer_xformers", action="store_true")
+    p.add_argument("--no_prefer_xformers", action="store_true")
+    p.add_argument("--strip_cross_attention", action="store_true")
+    p.add_argument("--keep_cross_attention", action="store_true")
+    p.add_argument("--disable_text", action="store_true")
+    p.add_argument("--enable_text", action="store_true")
+
     p.add_argument("--save_root_dir", type=str, default=None)
     p.add_argument("--save_name", type=str, default=None)
     p.add_argument("--preview_infer_steps", type=int, default=None)
@@ -892,13 +1082,30 @@ def load_merge_config(args: argparse.Namespace) -> DotDict:
             if v is not None and not isinstance(v, bool):
                 cfg[k] = v
 
-    # exclusive flags
+    # boolean flags (mutual exclusives)
     if getattr(args, "mask_free", False):
         cfg["mask_based"] = False
     elif getattr(args, "mask_based", False):
         cfg["mask_based"] = True
+
     if getattr(args, "invert_mask", False):
         cfg["invert_mask"] = True
+
+    if getattr(args, "no_prefer_xformers", False):
+        cfg["prefer_xformers"] = False
+    elif getattr(args, "prefer_xformers", False):
+        cfg["prefer_xformers"] = True
+
+    if getattr(args, "keep_cross_attention", False):
+        cfg["strip_cross_attention"] = False
+    elif getattr(args, "strip_cross_attention", False):
+        cfg["strip_cross_attention"] = True
+
+    # Keep "disable_text" for clarity, but we always zero embeds anyway.
+    if getattr(args, "enable_text", False):
+        cfg["disable_text"] = False
+    elif getattr(args, "disable_text", False):
+        cfg["disable_text"] = True
 
     if not cfg.get("list_file"):
         raise ValueError("`list_file` must be provided (YAML or CLI).")
