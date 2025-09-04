@@ -5,25 +5,34 @@ size_h: 512
 size_w: 384
 mask_based: true            # Stage-1은 true, Stage-2는 false
 invert_mask: true           # 의류 마스크 반대로 적용
-lr: 1.0e-5
-batch_size: 20
+use_scaler: true
+disable_text : true
+lr: 1.0e-4
+batch_size: 64
 grad_accum: 1
 max_steps: 256000           # 16000
 cond_dropout_p: 0.1
 mixed_precision: bf16       # H100이면 bf16 추천
 seed: 1337
 num_workers: 8
-preview_infer_steps : 16
+preview_infer_steps : 32
 preview_seed : 1234
 save_epoch_ckpt : 15
-disable_text : true
 default_resume_ckpt : None  # 특정 ckpt 경로
+resume_ckpt : None      # 특정 ckpt 경로
+adapter_alpha: 1.0
+
+# new
+preview_strength: 0.6      # NEW
+hole_loss_weight: 2.0      # NEW (left-half hole 가중)
+norm_match_adapter: true   # NEW (어댑터 노름 매칭)
+norm_match_clip: 5.0       # NEW
 
 # logging
 save_root_dir: logs
 save_name: catvton_sd35_mask
-log_every: 5
-image_every: 1000
+log_every: 10
+image_every: 200
 save_every: 12800
 
 # optional

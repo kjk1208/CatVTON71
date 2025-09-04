@@ -1,8 +1,14 @@
-# inference.py — FlowMatch-correct SD3.5 inference for CatVTON
+# inference.py — FlowMatch SD3.5 inference for CatVTON
+# - matches ddp_train_without_crossattn.py:
+#   * FlowMatchEulerDiscreteScheduler, prediction_type=v_prediction
+#   * zero-text (default), no cross-attn conditioning
+#   * z_t-only scaling (scale_model_input on noisy sample only)
+#   * residual adapter A([Xi, Mi]) with mask gate (+ optional norm-match)
+#   * img2img-style start using --strength (0..1)
+
 import os
 import re
 import csv
-import json
 import argparse
 from typing import Tuple, Dict, Any, List
 
@@ -27,26 +33,29 @@ except Exception as e:
 from huggingface_hub import snapshot_download
 from tqdm import tqdm
 
-# ---------- Utils (same as train) ----------
+
+# ---------- Utils (identical semantics to train) ----------
 def seed_everything(seed: int):
     import random
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+
 def from_uint8(img: Image.Image, size_hw: Tuple[int, int]) -> torch.Tensor:
-    # PIL -> [-1,1] CHW float tensor
     img = img.convert("RGB").resize(size_hw[::-1], Image.BICUBIC)
     x = torch.from_numpy(np.array(img, dtype=np.float32))  # HWC
     x = x.permute(2, 0, 1) / 255.0                         # CHW
     x = x * 2.0 - 1.0
     return x
 
+
 def load_mask(p: str, size_hw: Tuple[int, int]) -> torch.Tensor:
     m = Image.open(p).convert("L").resize(size_hw[::-1], Image.NEAREST)
     t = torch.from_numpy(np.array(m, dtype=np.float32)) / 255.0
     t = (t > 0.5).float().unsqueeze(0)  # (1,H,W)
     return t
+
 
 @torch.no_grad()
 def to_latent_sd3(vae, x_bchw: torch.Tensor) -> torch.Tensor:
@@ -57,6 +66,7 @@ def to_latent_sd3(vae, x_bchw: torch.Tensor) -> torch.Tensor:
     latents = (latents - sh) * sf
     return latents
 
+
 @torch.no_grad()
 def from_latent_sd3(vae, z: torch.Tensor) -> torch.Tensor:
     sf = vae.config.scaling_factor
@@ -65,9 +75,10 @@ def from_latent_sd3(vae, z: torch.Tensor) -> torch.Tensor:
     img = vae.decode(z).sample  # [-1,1]
     return img
 
+
 class ConcatProjector(nn.Module):
-    # 16 (z) + 16 (Xi) + 1 (mask) = 33 -> 16
-    def __init__(self, in_ch=33, out_ch=16):
+    # 16 (Xi) + 1 (Mi) = 17 -> 16 (adapter A)
+    def __init__(self, in_ch=17, out_ch=16):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(in_ch, 32, kernel_size=1, bias=False),
@@ -82,6 +93,7 @@ class ConcatProjector(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+
 def _as_1d_timesteps(scheduler, sample: torch.Tensor, t, B: int) -> torch.Tensor:
     if not torch.is_tensor(t):
         t = torch.tensor([t], device=sample.device)
@@ -95,6 +107,7 @@ def _as_1d_timesteps(scheduler, sample: torch.Tensor, t, B: int) -> torch.Tensor
         t = t[:1].repeat(B)
     return t
 
+
 def _scale_model_input_safe(scheduler, sample: torch.Tensor, timesteps) -> torch.Tensor:
     if not hasattr(scheduler, "scale_model_input"):
         return sample
@@ -105,8 +118,10 @@ def _scale_model_input_safe(scheduler, sample: torch.Tensor, timesteps) -> torch
     except Exception:
         return sample
 
+
 def _denorm01(x: torch.Tensor) -> torch.Tensor:
     return torch.clamp((x + 1.0) * 0.5, 0.0, 1.0)
+
 
 # ---------- Dataset for CSV (image, cloth, agnostic-mask) ----------
 class CSVVitonDataset(torch.utils.data.Dataset):
@@ -145,16 +160,15 @@ class CSVVitonDataset(torch.utils.data.Dataset):
         x_p_in = x_p * m
 
         x_concat_in = torch.cat([x_p_in, x_g], dim=2)  # [3,H,2W]
-        # no GT in pure inference; keep person & garment separately for panel
         return {
             "x_p": x_p, "x_g": x_g, "m": m,
             "x_concat_in": x_concat_in,
-            "paths": meta,
+            "paths": meta,  # keep raw paths for naming
         }
+
 
 # ---------- helpers ----------
 def _cfg_get(cfg, key, default=None):
-    """Works with OmegaConf/FrozenDict/dict/attrs."""
     try:
         return getattr(cfg, key)
     except Exception:
@@ -168,14 +182,12 @@ def _cfg_get(cfg, key, default=None):
     except Exception:
         return default
 
+
 def _derive_subdir_from_ckpt(ckpt_path: str) -> str:
-    """
-    Take .../<RUN_DIR>/models/<file.ckpt>  ->  extract 'YYYYMMDD_HHMMSS' if present
-    else fallback to basename(<RUN_DIR>).
-    """
-    parent2 = os.path.basename(os.path.dirname(os.path.dirname(ckpt_path)))  # run dir name (e.g., 20250830_151751_ddp)
+    parent2 = os.path.basename(os.path.dirname(os.path.dirname(ckpt_path)))  # run dir
     m = re.search(r"(\d{8}_\d{6})", parent2)
     return m.group(1) if m else parent2
+
 
 # ---------- Inference Runner ----------
 def run_inference(
@@ -195,18 +207,22 @@ def run_inference(
     save_left: bool,
     hf_token: str = None,
     device_pref: str = "auto",
-    out_sub_from_ckpt: bool = True,   # NEW: nest under OUTDIR/<run_stamp>/
+    out_sub_from_ckpt: bool = True,   # default on (convenience)
+    adapter_alpha: float = 1.0,
+    disable_text: bool = True,
+    strength: float = 0.6,            # match train preview default
+    norm_match_adapter: bool = True,
+    norm_match_clip: float = 5.0,
 ):
     os.makedirs(outdir, exist_ok=True)
 
-    # If requested, nest outputs in OUTDIR/<run_stamp> derived from ckpt
     if out_sub_from_ckpt:
         sub = _derive_subdir_from_ckpt(ckpt_path)
         outdir = os.path.join(outdir, sub)
         os.makedirs(outdir, exist_ok=True)
         print(f"[out] saving to {outdir}")
 
-    # Resolve device from user preference
+    # Resolve device
     device_pref = device_pref.lower()
     if device_pref not in {"auto", "cuda", "cpu"}:
         raise ValueError(f"Invalid --device '{device_pref}'. Choose from auto|cuda|cpu.")
@@ -217,7 +233,7 @@ def run_inference(
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Mixed precision selection with CPU guard
+    # Mixed precision with CPU guard
     mp2dtype = {"fp16": torch.float16, "fp32": torch.float32, "bf16": torch.bfloat16}
     dtype = mp2dtype.get(dtype_str, torch.float16)
     if device.type == "cpu":
@@ -227,7 +243,7 @@ def run_inference(
 
     seed_everything(seed)
 
-    # Download/read SD3.5
+    # SD3.5 weights
     local_dir = snapshot_download(
         repo_id=sd3_model, token=hf_token, revision=None,
         resume_download=True, local_files_only=False
@@ -237,7 +253,6 @@ def run_inference(
         local_dir, torch_dtype=dtype, local_files_only=True, use_safetensors=True,
     ).to(device)
 
-    # Enable mem-efficient attn in eval if available (CUDA only)
     if device.type == "cuda":
         try:
             pipe.transformer.enable_xformers_memory_efficient_attention()
@@ -249,7 +264,7 @@ def run_inference(
     transformer: SD3Transformer2DModel = pipe.transformer
     encode_prompt = pipe.encode_prompt
 
-    # ---------- load ckpt & restore scheduler config if present ----------
+    # ----- load ckpt & scheduler config -----
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"ckpt not found: {ckpt_path}")
     try:
@@ -260,26 +275,31 @@ def run_inference(
     sched_cfg = payload.get("scheduler_config", None)
     if sched_cfg is not None:
         scheduler: FlowMatchEulerDiscreteScheduler = FlowMatchEulerDiscreteScheduler.from_config(sched_cfg)
-        print("[sched] restored from ckpt scheduler_config")
+        print("[sched] restored scheduler_config from ckpt")
     else:
         scheduler: FlowMatchEulerDiscreteScheduler = FlowMatchEulerDiscreteScheduler.from_config(pipe.scheduler.config)
-        print("[sched] using scheduler from pipeline (no scheduler_config in ckpt)")
+        print("[sched] using scheduler from pipeline")
 
-    # Ensure prediction_type is v_prediction (as in training)
+    # ensure v_prediction
     pred_type = _cfg_get(scheduler.config, "prediction_type", None)
-    print("[debug] scheduler.prediction_type =", pred_type)
     if pred_type != "v_prediction":
         print("[fix] overriding scheduler.prediction_type -> v_prediction")
         scheduler.register_to_config(prediction_type="v_prediction")
-        print("[debug] scheduler.prediction_type (after) =", _cfg_get(scheduler.config, "prediction_type"))
 
-    # ---------- Load model weights ----------
+    # ----- load model weights -----
     msg_missing, msg_unexp = transformer.load_state_dict(payload["transformer"], strict=False)
     print(f"[load] transformer missing={len(msg_missing)} unexpected={len(msg_unexp)}")
 
-    projector = ConcatProjector(in_ch=33, out_ch=16).to(device, dtype=torch.float32)  # keep FP32 like train
-    proj_missing, proj_unexp = projector.load_state_dict(payload["projector"], strict=False)
-    print(f"[load] projector   missing={len(proj_missing)} unexpected={len(proj_unexp)}")
+    projector = ConcatProjector(in_ch=17, out_ch=16).to(device, dtype=torch.float32)
+    proj_sd = payload.get("projector", None)
+    if proj_sd is not None:
+        cur = projector.state_dict()
+        filt = {k: v for k, v in proj_sd.items() if (k in cur and cur[k].shape == v.shape)}
+        miss, unexp = projector.load_state_dict(filt, strict=False)
+        print(f"[load] projector loaded {len(filt)}/{len(cur)} keys "
+              f"(missing={len(miss)} unexpected={len(unexp)})")
+    else:
+        print("[load] no projector weights in ckpt; using randomly initialized adapter.")
 
     transformer.eval()
     projector.eval()
@@ -295,27 +315,43 @@ def run_inference(
         drop_last=False
     )
 
-    # Prompt embeds (empty) helper
-    def _encode_prompts(bsz: int):
-        empties = [""] * bsz
-        try:
-            pe, _, ppe, _ = encode_prompt(
-                prompt=empties, prompt_2=empties, prompt_3=empties,
-                device=device, num_images_per_prompt=1, do_classifier_free_guidance=False,
-            )
-        except TypeError:
-            pe, _, ppe, _ = encode_prompt(
-                prompt=empties, device=device, num_images_per_prompt=1, do_classifier_free_guidance=False,
-            )
-        return pe.to(dtype), ppe.to(dtype)
+    # Prompt embeds helper — zero-text default
+    def _encode_prompts(bsz: int, disable: bool):
+        if disable:
+            if not hasattr(_encode_prompts, "_pe_shape"):
+                try:
+                    pe_probe, _, ppe_probe, _ = encode_prompt(
+                        prompt=[""], prompt_2=[""], prompt_3=[""],
+                        device=device, num_images_per_prompt=1, do_classifier_free_guidance=False,
+                    )
+                except TypeError:
+                    pe_probe, _, ppe_probe, _ = encode_prompt(
+                        prompt=[""], device=device, num_images_per_prompt=1, do_classifier_free_guidance=False,
+                    )
+                _encode_prompts._pe_shape  = (pe_probe.shape[1], pe_probe.shape[2])
+                _encode_prompts._ppe_shape = (ppe_probe.shape[1],)
+            pe  = torch.zeros((bsz, *_encode_prompts._pe_shape),  dtype=dtype, device=device)
+            ppe = torch.zeros((bsz, *_encode_prompts._ppe_shape), dtype=dtype, device=device)
+            return pe, ppe
+        else:
+            empties = [""] * bsz
+            try:
+                pe, _, ppe, _ = encode_prompt(
+                    prompt=empties, prompt_2=empties, prompt_3=empties,
+                    device=device, num_images_per_prompt=1, do_classifier_free_guidance=False,
+                )
+            except TypeError:
+                pe, _, ppe, _ = encode_prompt(
+                    prompt=empties, device=device, num_images_per_prompt=1, do_classifier_free_guidance=False,
+                )
+            return pe.to(dtype), ppe.to(dtype)
 
-    # Generator for stable noise
     gen = torch.Generator(device=device).manual_seed(seed)
 
     with torch.no_grad():
         pbar_batches = tqdm(loader, desc="Batches", ncols=120)
         for bi, batch in enumerate(pbar_batches):
-            x_p = batch["x_p"].to(device)               # [-1,1]
+            x_p = batch["x_p"].to(device)                 # [-1,1]
             x_g = batch["x_g"].to(device)
             m   = batch["m"].to(device)
             x_in= batch["x_concat_in"].to(device, dtype)  # [-1,1]
@@ -323,38 +359,69 @@ def run_inference(
             B, _, H, WW = x_in.shape
             W = WW // 2
 
-            assert m.shape[-1] == W, f"mask width ({m.shape[-1]}) must equal person width W ({W})."
+            # m_concat has left-half only; right-half zeros (matches train)
             m_concat = torch.cat([m, torch.zeros_like(m)], dim=2)  # [B,1,H,2W]
 
             # Latents & mask downsample
-            Xi = to_latent_sd3(vae, x_in).to(dtype)                    # [B,16,H/8,2W/8]
+            Xi = to_latent_sd3(vae, x_in).to(dtype)                           # [B,16,H/8,2W/8]
             Mi = F.interpolate(m_concat, size=(H // 8, (2 * W) // 8), mode="nearest").to(dtype)
 
-            # Sampler setup
+            # --- Sampler setup (img2img-style start) ---
             scheduler.set_timesteps(steps, device=device)
-            sigma0 = float(getattr(scheduler, "init_noise_sigma",
-                                   scheduler.sigmas[0] if hasattr(scheduler, "sigmas") else 1.0))
-            z = torch.randn(Xi.shape, generator=gen, dtype=torch.float32, device=device) * sigma0
-            z = z.to(dtype)
+            s = float(max(0.0, min(1.0, strength)))
+            T = len(scheduler.timesteps)
+            init_timestep = min(int(T * s), T)
+            t_start = max(T - init_timestep, 0)
+            timesteps = scheduler.timesteps[t_start:]
+            if timesteps.numel() == 0:
+                timesteps = scheduler.timesteps[-1:].clone()
+                t_start = T - 1
 
-            prompt_embeds, pooled = _encode_prompts(B)
+            noise = torch.randn(Xi.shape, generator=gen, dtype=torch.float32, device=device)
 
-            # Per-step loop
-            pbar_steps = tqdm(scheduler.timesteps, total=len(scheduler.timesteps),
+            try:
+                z = scheduler.add_noise(Xi.float(), noise, timesteps[0]).to(dtype)
+            except Exception:
+                if hasattr(scheduler, "sigmas"):
+                    sigma = scheduler.sigmas[t_start].to(device)
+                else:
+                    sigma = torch.tensor(float(getattr(scheduler, "init_noise_sigma", 1.0)),
+                                         device=device, dtype=torch.float32)
+                z = (Xi.float() + noise * sigma).to(dtype)
+
+            prompt_embeds, pooled = _encode_prompts(B, disable_text)
+
+            # Per-step loop (partial denoise only)
+            pbar_steps = tqdm(timesteps, total=len(timesteps),
                               desc=f"Sampling b{bi}", ncols=120, leave=False)
             for t in pbar_steps:
-                t1d = _as_1d_timesteps(scheduler, z, t, B)
-                z_in  = _scale_model_input_safe(scheduler, z,  t1d)
-                Xi_in = _scale_model_input_safe(scheduler, Xi.float(), t1d)
+                t1d  = _as_1d_timesteps(scheduler, z, t, B)
+                z_in = _scale_model_input_safe(scheduler, z, t1d)             # ★ z_t만 스케일
 
-                hidden = torch.cat([z_in.float(), Xi_in, Mi.float()], dim=1)
-                hidden = torch.nan_to_num(hidden, nan=0.0, posinf=30.0, neginf=-30.0).clamp_(-30.0, 30.0)
+                # adapter: A([Xi,Mi]) with mask gate (+ optional norm-match)
+                cm    = torch.cat([Xi.float(), Mi.float()], dim=1)            # [B,17,h,w]
+                cm    = torch.nan_to_num(cm, nan=0.0, posinf=30.0, neginf=-30.0).clamp_(-30.0, 30.0)
+                adapt = projector(cm)                                         # [B,16,h,w] (fp32)
+                gate  = (Mi > 0).float()
+                adapt = adapt * gate
 
-                proj = projector(hidden).to(dtype)
+                if norm_match_adapter:
+                    eps = 1e-6
+                    num = z_in.float().flatten(1).norm(dim=1, keepdim=True)    # ||z_t||
+                    den = adapt.flatten(1).norm(dim=1, keepdim=True) + eps     # ||A||
+                    scale = (num / den).view(B, 1, 1, 1).clamp(0.0, float(norm_match_clip))
+                    adapt = adapt * scale
+
+                hidden_in = (z_in.float() + adapter_alpha * adapt).to(dtype)   # residual
+
                 if device.type == "cuda":
-                    with torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=True):
+                    with torch.amp.autocast(
+                        device_type='cuda',
+                        dtype=dtype,
+                        enabled=(dtype in (torch.float16, torch.bfloat16))
+                    ):
                         v = transformer(
-                            hidden_states=proj,
+                            hidden_states=hidden_in,
                             timestep=t1d,
                             encoder_hidden_states=prompt_embeds,
                             pooled_projections=pooled,
@@ -362,7 +429,7 @@ def run_inference(
                         ).sample
                 else:
                     v = transformer(
-                        hidden_states=proj,
+                        hidden_states=hidden_in,
                         timestep=t1d,
                         encoder_hidden_states=prompt_embeds,
                         pooled_projections=pooled,
@@ -371,24 +438,23 @@ def run_inference(
 
                 z = scheduler.step(v, t, z).prev_sample
 
-            x_hat = from_latent_sd3(vae, z)        # [-1,1], shape [B,3,H,2W]
+            x_hat = from_latent_sd3(vae, z)        # [-1,1], [B,3,H,2W]
             x_hat01 = _denorm01(x_hat)             # [0,1]
 
             # Saves
             for i in range(B):
-                base = os.path.splitext(os.path.basename(batch["paths"]["person"][i]))[0]
-                # concat prediction
+                meta_i = batch["paths"][i] if isinstance(batch["paths"], list) else batch["paths"]
+                base = os.path.splitext(os.path.basename(meta_i["person"]))[0]
+
                 if save_concat:
                     out_concat_path = os.path.join(outdir, f"{base}_pred_concat.png")
                     save_image(x_hat01[i], out_concat_path)
 
-                # left-half (try-on) crop
                 if save_left:
                     left = x_hat01[i, :, :, :W]
                     out_left_path = os.path.join(outdir, f"{base}_tryon.png")
                     save_image(left, out_left_path)
 
-                # optional panel
                 if save_panel:
                     person = _denorm01(x_p[i])
                     garment = _denorm01(x_g[i])
@@ -396,10 +462,7 @@ def run_inference(
                     masked_person = person * mask_vis
                     concat_in = _denorm01(x_in[i])
 
-                    tiles = [
-                        person, mask_vis, masked_person,
-                        garment, concat_in, x_hat01[i]
-                    ]
+                    tiles = [person, mask_vis, masked_person, garment, concat_in, x_hat01[i]]
                     row = torch.cat(tiles, dim=2)
                     grid = make_grid(row, nrow=1)
                     out_panel_path = os.path.join(outdir, f"{base}_panel.png")
@@ -407,13 +470,14 @@ def run_inference(
 
             print(f"[{bi+1}/{len(loader)}] saved batch")
 
+
 # ---------- CLI ----------
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data_csv", type=str, required=True,
                    help="CSV path with headers: image, cloth, agnostic-mask")
     p.add_argument("--ckpt", type=str, required=True,
-                   help="Checkpoint path, e.g., logs/.../[Train]_[120]_[0.1961].ckpt")
+                   help="Checkpoint path, e.g., logs/.../epoch_xxx.ckpt")
     p.add_argument("--sd3_model", type=str, default="stabilityai/stable-diffusion-3.5-large")
     p.add_argument("--outdir", type=str, default="infer_out")
     p.add_argument("--size_h", type=int, default=512)
@@ -431,10 +495,30 @@ def parse_args():
                    help="Select device. 'auto' uses CUDA if available, else CPU.")
     p.add_argument("--out_sub_from_ckpt", action="store_true",
                    help="Nest outputs under OUTDIR/<YYYYMMDD_HHMMSS> derived from CKPT path.")
+
+    # NEW: align with train preview/adapter options
+    p.add_argument("--adapter_alpha", type=float, default=1.0)
+    p.add_argument("--disable_text", action="store_true")
+    p.add_argument("--enable_text", action="store_true")
+    p.add_argument("--strength", type=float, default=0.6,
+                   help="0..1, img2img noise amount (0=keep input, 1=text2img-like)")
+    p.add_argument("--no_norm_match_adapter", action="store_true",
+                   help="Disable norm matching of adapter to z_t norm")
+    p.add_argument("--norm_match_clip", type=float, default=5.0,
+                   help="Clamp for norm-match scale (default 5.0)")
     return p.parse_args()
+
 
 def main():
     args = parse_args()
+
+    # resolve disable_text like train (default True unless --enable_text)
+    disable_text = True
+    if args.enable_text:
+        disable_text = False
+    elif args.disable_text:
+        disable_text = True
+
     run_inference(
         data_csv=args.data_csv,
         ckpt_path=args.ckpt,
@@ -452,8 +536,14 @@ def main():
         save_left=(not args.no_save_left),
         hf_token=args.hf_token,
         device_pref=args.device,
-        out_sub_from_ckpt=args.out_sub_from_ckpt or True,  # default on
+        out_sub_from_ckpt=args.out_sub_from_ckpt or True,  # keep default-on behavior
+        adapter_alpha=args.adapter_alpha,
+        disable_text=disable_text,
+        strength=args.strength,
+        norm_match_adapter=(not args.no_norm_match_adapter),
+        norm_match_clip=args.norm_match_clip,
     )
+
 
 if __name__ == "__main__":
     main()

@@ -1,9 +1,10 @@
 # ddp_train_without_crossattn.py — SD3.5 CatVTON (DDP-ready)
-# - train/infer scheduler split (DDPM train, FlowMatch Euler infer) with v-pred
-# - cross-attention effectively disabled (zero-context wrappers + zero text embeds)
-# - freeze only self-attn Q/K/V/Out (no FFN/norm/cross) — robust module-walk
-# - prefer xFormers; fallback to PyTorch SDPA (AttnProcessor2_0)
-# - left-half loss weighting & clearer logging
+# - DDPM(train) / FlowMatch Euler(infer/preview) split with v-pred
+# - zero-text embeds (cross-attn effectively off, no custom attn wrappers)
+# - freeze only self-attn Q/K/V/Out
+# - adapter residual is mask-gated (+ optional norm matching)
+# - hole-weighted loss on try-on (left) half
+# - img2img-style preview (strength-based partial denoise)
 
 import os
 import re
@@ -44,11 +45,6 @@ try:
 except Exception:
     pass
 
-try:
-    torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False)
-except Exception:
-    pass
-
 # ------------------------------------------------------------
 # Diffusers (SD3.5 / SD3)
 # ------------------------------------------------------------
@@ -66,12 +62,9 @@ try:
 except Exception as e:
     raise ImportError("Schedulers not found. Please update diffusers (>=0.34).") from e
 
-# attention processors
+# (we will NOT install custom attention processors; stick to built-ins)
 try:
-    from diffusers.models.attention_processor import (
-        AttnProcessor2_0,   # SDPA
-        XFormersAttnProcessor,  # xFormers
-    )
+    from diffusers.models.attention_processor import AttnProcessor2_0, XFormersAttnProcessor
     _HAS_ATTENTION_PROCESSORS = True
 except Exception:
     _HAS_ATTENTION_PROCESSORS = False
@@ -79,7 +72,7 @@ except Exception:
     XFormersAttnProcessor = object
 
 from huggingface_hub import snapshot_download
-from torch.cuda.amp import GradScaler
+from torch import amp as torch_amp
 
 
 # ------------------------------------------------------------
@@ -150,7 +143,7 @@ class NoopWriter:
 def ddp_state_dict(m: nn.Module):
     return m.module.state_dict() if isinstance(m, DDP) else m.state_dict()
 
-# === DEBUG: trainable 파라미터 요약 출력 ===
+
 def _debug_print_trainables(mod: nn.Module, tag: str, max_items: int = 10):
     total = sum(p.numel() for p in mod.parameters())
     train = sum(p.numel() for p in mod.parameters() if p.requires_grad)
@@ -246,6 +239,7 @@ def from_latent_sd3(vae, z: torch.Tensor) -> torch.Tensor:
 
 
 class ConcatProjector(nn.Module):
+    # default in_ch kept as 33 for backward compat, but we pass 17 in ctor
     def __init__(self, in_ch=33, out_ch=16):
         super().__init__()
         self.net = nn.Sequential(
@@ -263,7 +257,7 @@ class ConcatProjector(nn.Module):
 
 
 # ------------------------------------------------------------
-# Freezing & attention processors
+# Freezing & attention backend
 # ------------------------------------------------------------
 def freeze_all_but_self_attn_qkv(transformer: SD3Transformer2DModel):
     for p in transformer.parameters():
@@ -294,112 +288,20 @@ def freeze_all_but_self_attn_qkv(transformer: SD3Transformer2DModel):
     return trainable, kept
 
 
-# ---- Safe wrappers for SELF attention: force 2-tuple (self_out, ctx_out=zeros_like(...)) ----
-class SD3SafeAttnProcessorSDPA(AttnProcessor2_0):
-    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, **kwargs):
-        out = super().__call__(attn, hidden_states, encoder_hidden_states, attention_mask, **kwargs)
-        # normalize outputs to exactly (self_out, ctx_out)
-        if isinstance(out, tuple):
-            self_out = out[0]
-            ctx_out  = out[1] if len(out) >= 2 else torch.zeros_like(
-                encoder_hidden_states if encoder_hidden_states is not None else hidden_states
-            )
-        else:
-            self_out = out
-            ctx_out  = torch.zeros_like(encoder_hidden_states if encoder_hidden_states is not None else hidden_states)
-        return self_out, ctx_out
-
-try:
-    class SD3SafeAttnProcessorXFormers(XFormersAttnProcessor):
-        def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, **kwargs):
-            out = super().__call__(attn, hidden_states, encoder_hidden_states, attention_mask, **kwargs)
-            if isinstance(out, tuple):
-                self_out = out[0]
-                ctx_out  = out[1] if len(out) >= 2 else torch.zeros_like(
-                    encoder_hidden_states if encoder_hidden_states is not None else hidden_states
-                )
-            else:
-                self_out = out
-                ctx_out  = torch.zeros_like(encoder_hidden_states if encoder_hidden_states is not None else hidden_states)
-            return self_out, ctx_out
-except Exception:
-    pass
-
-# ---- Cross attention zero-context wrappers: also force exactly 2 outputs ----
-class ZeroContextSDPA(AttnProcessor2_0):
-    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, **kwargs):
-        if encoder_hidden_states is not None:
-            encoder_hidden_states = torch.zeros_like(encoder_hidden_states)
-        out = super().__call__(attn, hidden_states, encoder_hidden_states, attention_mask, **kwargs)
-        if isinstance(out, tuple):
-            self_out = out[0]
-            ctx_out  = out[1] if len(out) >= 2 else torch.zeros_like(
-                encoder_hidden_states if encoder_hidden_states is not None else hidden_states
-            )
-        else:
-            self_out = out
-            ctx_out  = torch.zeros_like(encoder_hidden_states if encoder_hidden_states is not None else hidden_states)
-        return self_out, ctx_out
-
-try:
-    class ZeroContextXFormers(XFormersAttnProcessor):
-        def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, **kwargs):
-            if encoder_hidden_states is not None:
-                encoder_hidden_states = torch.zeros_like(encoder_hidden_states)
-            out = super().__call__(attn, hidden_states, encoder_hidden_states, attention_mask, **kwargs)
-            if isinstance(out, tuple):
-                self_out = out[0]
-                ctx_out  = out[1] if len(out) >= 2 else torch.zeros_like(
-                    encoder_hidden_states if encoder_hidden_states is not None else hidden_states
-                )
-            else:
-                self_out = out
-                ctx_out  = torch.zeros_like(encoder_hidden_states if encoder_hidden_states is not None else hidden_states)
-            return self_out, ctx_out
-except Exception:
-    pass
-
-
-def apply_attention_processors(transformer: SD3Transformer2DModel, logger: logging.Logger,
-                               prefer_xformers: bool = True, zero_cross_attn: bool = True) -> str:
-    if not _HAS_ATTENTION_PROCESSORS or not hasattr(transformer, "set_attn_processor"):
-        try:
-            if prefer_xformers:
-                transformer.enable_xformers_memory_efficient_attention()
-                return "xformers_via_enable()"
-        except Exception as e:
-            logger.info(f"[mem] xFormers not available via enable(): {e}")
-        return "default_attention"
-
+def apply_attention_backend(transformer: SD3Transformer2DModel, logger: logging.Logger,
+                            prefer_xformers: bool = True) -> str:
+    """
+    Keep things simple & stable:
+      - Prefer built-in xFormers memory-efficient attention (no custom wrappers).
+      - Else fall back to default SDPA/attn.
+    Cross-attn is effectively disabled by feeding zero text embeddings elsewhere.
+    """
     try:
-        keys = list(transformer.attn_processors.keys())
-    except Exception:
-        keys = []
-
-    use_xformers = False
-    if prefer_xformers:
-        try:
-            _ = XFormersAttnProcessor
-            use_xformers = True
-        except Exception:
-            use_xformers = False
-
-    procs = {}
-    for k in keys:
-        is_cross = ("attn2" in k) or ("cross" in k) or ("encoder" in k)
-
-        if is_cross and zero_cross_attn:
-            procs[k] = ZeroContextXFormers() if use_xformers else ZeroContextSDPA()
-        else:
-            # SELF attention must also be wrapped to return exactly 2 outputs
-            procs[k] = SD3SafeAttnProcessorXFormers() if use_xformers else SD3SafeAttnProcessorSDPA()
-
-    if procs:
-        transformer.set_attn_processor(procs)
-        return ("xformers+zero_ctx" if use_xformers and zero_cross_attn
-                else "xformers" if use_xformers
-                else "sdpa+zero_ctx" if zero_cross_attn
-                else "sdpa")
+        if prefer_xformers:
+            transformer.enable_xformers_memory_efficient_attention()
+            return "xformers_via_enable()"
+    except Exception as e:
+        logger.info(f"[mem] xFormers not available via enable(): {e}")
     return "default_attention"
 
 
@@ -515,16 +417,16 @@ class CatVTON_SD3_Trainer:
             if self.is_main: print(msg)
             self.logger.info(msg)
 
-        # attention processors
-        attn_mode = apply_attention_processors(
-            self.transformer, self.logger,
-            prefer_xformers=cfg.prefer_xformers, zero_cross_attn=cfg.strip_cross_attention
+        # attention backend (no custom wrappers)
+        attn_mode = apply_attention_backend(
+            self.transformer, self.logger, prefer_xformers=cfg.prefer_xformers
         )
         if self.is_main:
             self.logger.info(f"[mem] attention_backend={attn_mode}")
 
         # projector: keep FP32
-        self.projector = ConcatProjector(in_ch=33, out_ch=16).to(self.device, dtype=torch.float32)
+        self.projector = ConcatProjector(in_ch=17, out_ch=16).to(self.device, dtype=torch.float32)
+        self.adapter_alpha = float(getattr(cfg, "adapter_alpha", 1.0))
         self.start_epoch = 0
         self.start_step = 0
         self._loaded_ckpt_optimizer = None
@@ -593,7 +495,7 @@ class CatVTON_SD3_Trainer:
         # flags for safe scaling
         self._has_scale_model_input_infer = hasattr(self.scheduler, "scale_model_input")
         self._has_scale_model_input_train = hasattr(self.train_scheduler, "scale_model_input")
-        
+
         # DDP wrap
         self.transformer = DDP(
             self.transformer, device_ids=[self.local_rank], output_device=self.local_rank,
@@ -634,23 +536,20 @@ class CatVTON_SD3_Trainer:
     def _encode_prompts(self, bsz: int):
         empties = [""] * bsz
 
-        # 1) 텍스트 끌 때: 한 번만 shape probe -> zero 텐서 생성
+        # zero-text mode (default)
         if getattr(self.cfg, "disable_text", True):
             if not hasattr(self, "_enc_shapes"):
                 with torch.no_grad():
                     try:
-                        # SD3.x(3-프롬프트) 우선
                         pe_probe, _, ppe_probe, _ = self.encode_prompt(
                             prompt=[""], prompt_2=[""], prompt_3=[""],
                             device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False,
                         )
                     except TypeError:
-                        # 구버전(1-프롬프트) 폴백
                         pe_probe, _, ppe_probe, _ = self.encode_prompt(
                             prompt=[""],
                             device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False,
                         )
-                # pe: (B, seq, dim), ppe: (B, dim)
                 self._pe_seq = pe_probe.shape[1]
                 self._pe_dim = pe_probe.shape[2]
                 self._ppe_dim = ppe_probe.shape[1]
@@ -658,7 +557,7 @@ class CatVTON_SD3_Trainer:
             ppe = torch.zeros((bsz, self._ppe_dim),                dtype=self.dtype, device=self.device)
             return pe, ppe
 
-        # 2) 텍스트 쓸 때: 실제 인코딩 (3-프롬프트 -> 1-프롬프트 폴백)
+        # encode empties if text enabled
         try:
             pe, _, ppe, _ = self.encode_prompt(
                 prompt=empties, prompt_2=empties, prompt_3=empties,
@@ -703,6 +602,7 @@ class CatVTON_SD3_Trainer:
 
     @torch.no_grad()
     def _preview_sample(self, batch: Dict[str, torch.Tensor], num_steps: int) -> torch.Tensor:
+        """Img2img-style preview: start from add_noise(Xi, t_start) and denoise only tail."""
         H, W = self.cfg.size_h, self.cfg.size_w
         x_in = batch["x_concat_in"].to(self.device, self.dtype)
         m    = batch["m_concat"].to(self.device, self.dtype)
@@ -711,29 +611,64 @@ class CatVTON_SD3_Trainer:
         Mi = F.interpolate(m, size=(H // 8, (2 * W) // 8), mode="nearest").to(self.dtype)
         B, C, h, w = Xi.shape
 
-        # timesteps / init noise
+        # timesteps / start from t_start (strength)
         self.scheduler.set_timesteps(num_steps, device=self.device)
-        sigma0 = float(getattr(self.scheduler, "init_noise_sigma",
-                               self.scheduler.sigmas[0] if hasattr(self.scheduler, "sigmas") else 1.0))
-        z = torch.randn((B, C, h, w), generator=self._preview_gen,
-                        device=self.device, dtype=torch.float32) * sigma0
-        z = z.to(self.dtype)
+        T = len(self.scheduler.timesteps)
+        s = float(max(0.0, min(1.0, float(self.cfg.preview_strength))))
+        init_timestep = min(int(T * s), T)
+        t_start = max(T - init_timestep, 0)
+        timesteps = self.scheduler.timesteps[t_start:]
+        if timesteps.numel() == 0:
+            timesteps = self.scheduler.timesteps[-1:].clone()
+            t_start = T - 1
+
+        noise = torch.randn(Xi.shape, generator=self._preview_gen, dtype=torch.float32, device=Xi.device)
+
+        try:
+            z = self.scheduler.add_noise(Xi.float(), noise, timesteps[0]).to(self.dtype)
+        except Exception:
+            if hasattr(self.scheduler, "sigmas"):
+                sigma = self.scheduler.sigmas[t_start].to(self.device)
+            else:
+                sigma = torch.tensor(float(getattr(self.scheduler, "init_noise_sigma", 1.0)),
+                                     device=self.device, dtype=torch.float32)
+            z = (Xi.float() + noise * sigma).to(self.dtype)
 
         prompt_embeds, pooled = self._encode_prompts(B)
 
-        for t in self.scheduler.timesteps:
+        # mask gate
+        w2 = Mi.shape[-1] // 2
+        gate = torch.zeros_like(Mi)
+        gate[:, :, :, :w2] = (1.0 - Mi[:, :, :, :w2]).float()   # 왼쪽 hole만 1
+
+        # optional norm matching scale
+        def norm_match_scale(a: torch.Tensor, b: torch.Tensor, clip: float) -> torch.Tensor:
+            eps = 1e-6
+            s = (a.flatten(1).norm(dim=1, keepdim=True) /
+                 (b.flatten(1).norm(dim=1, keepdim=True) + eps)).view(B, 1, 1, 1)
+            return s.clamp(0.0, clip)
+
+        for t in timesteps:
             t1d = self._as_1d_timesteps(z, t, B, self.scheduler)
-            z_in  = self._scale_model_input_safe(z, t1d, self.scheduler)
+            z_in = self._scale_model_input_safe(z, t1d, self.scheduler)
 
-            # IMPORTANT: do NOT scale Xi/Mi by timestep
-            hidden = torch.cat([z_in.float(), Xi.float(), Mi.float()], dim=1)
-            hidden = torch.nan_to_num(hidden, nan=0.0, posinf=30.0, neginf=-30.0).clamp_(-30.0, 30.0)
+            cm = torch.cat([Xi.float(), Mi.float()], dim=1)                     # [B,17,h,w]
+            cm = torch.nan_to_num(cm, nan=0.0, posinf=30.0, neginf=-30.0).clamp_(-30.0, 30.0)
 
-            proj = self.projector.module(hidden).to(self.dtype) if isinstance(self.projector, DDP) else self.projector(hidden).to(self.dtype)
+            adapt = (self.projector.module(cm) if isinstance(self.projector, DDP) else self.projector(cm))  # fp32
+            adapt = adapt * gate  # gate to mask region only
+
+            if self.cfg.norm_match_adapter:
+                sclip = float(self.cfg.norm_match_clip)
+                scale = norm_match_scale(z_in.float(), adapt, sclip)
+                adapt = adapt * scale
+
+            hidden_in = (z_in.float() + self.adapter_alpha * adapt).to(self.dtype)
+
             with torch.amp.autocast(device_type='cuda', dtype=self.dtype, enabled=(self.device.type == 'cuda')):
                 model = self.transformer.module if isinstance(self.transformer, DDP) else self.transformer
                 v = model(
-                    hidden_states=proj,
+                    hidden_states=hidden_in,
                     timestep=t1d,
                     encoder_hidden_states=prompt_embeds,
                     pooled_projections=pooled,
@@ -827,13 +762,24 @@ class CatVTON_SD3_Trainer:
         # --------- Preconditioning: scale z_t ONLY ---------
         scaled_noisy_f32 = self._scale_model_input_safe(noisy_f32, timesteps, self.train_scheduler)
 
-        # IMPORTANT: do NOT scale Xi/Mi by timestep
-        hidden_cat_f32 = torch.cat([scaled_noisy_f32, Xi.float(), Mi.float()], dim=1)
-        hidden_cat_f32 = torch.nan_to_num(hidden_cat_f32, nan=0.0, posinf=30.0, neginf=-30.0).clamp_(-30.0, 30.0)
+        # --------- Adapter (mask-gated + optional norm-match) ---------
+        cm_f32 = torch.cat([Xi.float(), Mi.float()], dim=1)                                # [B,17,h,w]
+        cm_f32 = torch.nan_to_num(cm_f32, nan=0.0, posinf=30.0, neginf=-30.0).clamp_(-30.0, 30.0)
+        adapt_f32 = (self.projector.module(cm_f32) if isinstance(self.projector, DDP) else self.projector(cm_f32))  # [B,16,h,w]
 
-        proj_out_f32 = (self.projector.module(hidden_cat_f32) if isinstance(self.projector, DDP)
-                        else self.projector(hidden_cat_f32))
-        hidden_in    = proj_out_f32.to(self.dtype)
+        w2 = Mi.shape[-1] // 2
+        gate = torch.zeros_like(Mi)
+        gate[:, :, :, :w2] = (1.0 - Mi[:, :, :, :w2]).float()   # 왼쪽 hole만 1
+        adapt_f32 = adapt_f32 * gate
+
+        if self.cfg.norm_match_adapter:
+            eps = 1e-6
+            s = (scaled_noisy_f32.flatten(1).norm(dim=1, keepdim=True) /
+                 (adapt_f32.flatten(1).norm(dim=1, keepdim=True) + eps)).view(B, 1, 1, 1)
+            s = s.clamp(0.0, float(self.cfg.norm_match_clip))
+            adapt_f32 = adapt_f32 * s
+
+        hidden_in = (scaled_noisy_f32 + self.adapter_alpha * adapt_f32).to(self.dtype)
 
         prompt_embeds, pooled_prompt_embeds = self._encode_prompts(B)
 
@@ -849,12 +795,14 @@ class CatVTON_SD3_Trainer:
 
         out_f32 = out.float()
 
-        # --------- Loss (emphasize left/try-on half) ---------
+        # --------- Loss (emphasize HOLE on left/try-on half) ---------
         h, w = out_f32.shape[-2], out_f32.shape[-1]
         wmap = torch.ones((B, 1, h, w), device=out_f32.device, dtype=out_f32.dtype)
-        left_half = Mi[:, :, :, :w//2]        # Mi already sized (h, 2w); use left half only
-        left_bin  = (left_half > 0).float()
-        wmap[:, :, :, :w//2] = 1.0 + left_bin
+
+        left_keep = (Mi[:, :, :, :w//2] > 0).float()  # keep=1, hole=0
+        left_hole = 1.0 - left_keep                   # hole=1
+        wmap[:, :, :, :w//2] = 1.0 + float(self.cfg.hole_loss_weight) * left_hole
+
         loss = torch.mean(((out_f32 - target_f32) ** 2) * wmap)
 
         if not torch.isfinite(loss) or not loss.requires_grad:
@@ -892,15 +840,11 @@ class CatVTON_SD3_Trainer:
         if not resume_path or not os.path.isfile(resume_path):
             return
 
-        # GPU 메모리 터지지 않도록 우선 CPU로 로드
         ckpt = torch.load(resume_path, map_location="cpu")
 
-        # --- 1) 모델 가중치: DDP 감싸기 전, 원본 모듈에 로드 ---
-        # (지금 __init__에서 DDP로 감싸기 전에 호출해야 함)
         try:
             self.transformer.load_state_dict(ckpt["transformer"], strict=False)
         except Exception:
-            # 혹시나 키 mismatch 시 강제 매핑
             self.transformer.load_state_dict(ckpt["transformer"], strict=False)
 
         try:
@@ -908,14 +852,10 @@ class CatVTON_SD3_Trainer:
         except Exception:
             self.projector.load_state_dict(ckpt["projector"], strict=False)
 
-        # --- 2) 에폭/스텝 ---
         self.start_epoch = int(ckpt.get("epoch", 0))
         self.start_step  = int(ckpt.get("global_step", 0))
 
-        # --- 3) 옵티마이저는 나중에 로드하기 위해 보관 ---
         self._loaded_ckpt_optimizer = ckpt.get("optimizer", None)
-
-        # (선택) GradScaler / RNG 상태도 쓴다면 여기에 보관
         self._loaded_ckpt_scaler = ckpt.get("scaler_state", None)
         self._loaded_rng = ckpt.get("rng_state", None)
         self._loaded_cuda_rng = ckpt.get("cuda_rng_state_all", None)
@@ -924,13 +864,12 @@ class CatVTON_SD3_Trainer:
             self.logger.info(f"[resume] loaded {resume_path} | start_epoch={self.start_epoch}, start_step={self.start_step}")
             print(f"[resume] loaded {resume_path} | start_epoch={self.start_epoch}, start_step={self.start_step}")
 
-
     def train(self):
         global_step = getattr(self, "start_step", 0)
         epoch = getattr(self, "start_epoch", 0)
         self.transformer.train()
         self.projector.train()
-        self.scaler = GradScaler(enabled=self.use_scaler)
+        self.scaler = torch_amp.GradScaler('cuda') if self.use_scaler else None
 
         if self._loaded_ckpt_scaler is not None and self.use_scaler:
             self.scaler.load_state_dict(self._loaded_ckpt_scaler)
@@ -947,7 +886,7 @@ class CatVTON_SD3_Trainer:
             desc=f"Epoch {epoch}",
             leave=True,
             disable=(not self.is_main) or (not sys.stdout.isatty()),
-            initial=global_step,   # <- 진행률 맞춰 표시
+            initial=global_step,
         )
 
         if self.is_dist and self.sampler is not None:
@@ -1077,19 +1016,26 @@ DEFAULTS = {
     "lr": 1e-5, "batch_size": 4, "grad_accum": 1, "max_steps": 128000,
     "seed": 1337, "num_workers": 4, "cond_dropout_p": 0.1,
     "mixed_precision": "fp16", "loss_sigma_weight": False,
+    "adapter_alpha": 1.0,
+    "use_scaler": True,
 
     "prefer_xformers": True,
-    "strip_cross_attention": True,
+    "strip_cross_attention": True,  # kept for backward-compat (handled via zero-text)
     "disable_text": True,
 
     "save_root_dir": "logs", "save_name": "catvton_sd35",
     "log_every": 50, "image_every": 500, "save_every": 12800,
     "save_epoch_ckpt": 15,
-    "default_resume_ckpt": None,  # 특정 ckpt 경로
-    "resume_ckpt": None, 
+    "default_resume_ckpt": None,
+    "resume_ckpt": None,
 
     "preview_infer_steps": 16,
+    "preview_strength": 0.6,     # NEW: img2img start amount for preview
     "preview_seed": 1234,
+
+    "hole_loss_weight": 2.0,     # NEW: weight for hole region on left half
+    "norm_match_adapter": True,  # NEW: scale adapter to z_t norm
+    "norm_match_clip": 5.0,      # NEW: clamp for norm scale
 
     "hf_token": None,
 }
@@ -1128,8 +1074,15 @@ def parse_args():
     p.add_argument("--save_root_dir", type=str, default=None)
     p.add_argument("--save_name", type=str, default=None)
     p.add_argument("--preview_infer_steps", type=int, default=None)
+    p.add_argument("--preview_strength", type=float, default=None)
     p.add_argument("--preview_seed", type=int, default=None)
-    p.add_argument("--resume_ckpt", type=str, default=None,help="path to checkpoint to resume from")
+    p.add_argument("--resume_ckpt", type=str, default=None, help="path to checkpoint to resume from")
+
+    # NEW knobs
+    p.add_argument("--hole_loss_weight", type=float, default=None)
+    p.add_argument("--no_norm_match_adapter", action="store_true")
+    p.add_argument("--norm_match_clip", type=float, default=None)
+
     return p.parse_args()
 
 
@@ -1162,6 +1115,7 @@ def load_merge_config(args: argparse.Namespace) -> DotDict:
     elif getattr(args, "prefer_xformers", False):
         cfg["prefer_xformers"] = True
 
+    # keep flag for compatibility; actual cross disabling is via zero-text
     if getattr(args, "keep_cross_attention", False):
         cfg["strip_cross_attention"] = False
     elif getattr(args, "strip_cross_attention", False):
@@ -1171,6 +1125,9 @@ def load_merge_config(args: argparse.Namespace) -> DotDict:
         cfg["disable_text"] = False
     elif getattr(args, "disable_text", False):
         cfg["disable_text"] = True
+
+    if getattr(args, "no_norm_match_adapter", False):
+        cfg["norm_match_adapter"] = False
 
     if not cfg.get("list_file"):
         raise ValueError("`list_file` must be provided (YAML or CLI).")
