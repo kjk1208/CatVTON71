@@ -1,0 +1,46 @@
+list_file: DATA/VITON-HD/vitonhd_train_mask.csv
+sd3_model: stabilityai/stable-diffusion-3.5-large
+
+size_h: 512
+size_w: 384
+
+mask_based: false         # ★ Stage-2 핵심
+invert_mask: false        # 무의미, 아무 값이나 상관없음
+
+# training
+disable_text: true
+lr: 5.0e-5                # Stage-2는 조금 낮게 권장
+batch_size: 64
+grad_accum: 1
+max_steps: 128000
+cond_dropout_p: 0.1
+mixed_precision: bf16
+seed: 1337
+num_workers: 8
+
+# preview
+preview_infer_steps: 32
+preview_seed: 1234
+preview_strength: 0.9     # 전역 복원 느낌
+save_epoch_ckpt: 15
+
+# checkpoints & logging
+default_resume_ckpt: None
+resume_ckpt: None         # (옵션) Stage-1에서 이어 학습하려면 여기에 Stage-1 ckpt 경로
+save_root_dir: logs
+save_name: catvton_sd35_stage2
+log_every: 10
+image_every: 200
+save_every: 12800
+
+# adapter / projector
+adapter_alpha: 1.0
+norm_match_adapter: true
+norm_match_clip: 5.0
+
+# losses
+hole_loss_weight: 0.0     # ★ Stage-2는 0
+keep_consistency_lambda: 0.0
+
+# runtime
+hf_token: "${HUGGINGFACE_TOKEN}"

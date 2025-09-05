@@ -1,10 +1,10 @@
-# ddp_train_without_crossattn.py — SD3.5 CatVTON (DDP-ready)
-# - DDPM(train) / FlowMatch Euler(infer/preview) split with v-pred
-# - zero-text embeds (cross-attn effectively off, no custom attn wrappers)
-# - freeze only self-attn Q/K/V/Out
-# - adapter residual is mask-gated (+ optional norm matching)
-# - hole-weighted loss on try-on (left) half
-# - img2img-style preview (strength-based partial denoise)
+# ddp_train_stage1.py — SD3.5 CatVTON (DDP-ready, 33ch concat path)
+# - Train: DDPM (v-pred) with inpainting-style forward
+#   x_t = Mi*Xi_noisy + (1−Mi)*z0_noisy
+# - Infer/Preview: FlowMatch Euler + per-step recomposition (hard preservation)
+# - Zero-text embeds (cross-attn effectively off); freeze only self-attn Q/K/V/Out
+# - 33ch concat: [z_t(16) , Xi(16) , Mi(1)] → projector(33→16) → transformer
+# - Hole-weighted loss on true hole(1−Mi), not on left-half assumption
 
 import os
 import re
@@ -62,7 +62,6 @@ try:
 except Exception as e:
     raise ImportError("Schedulers not found. Please update diffusers (>=0.34).") from e
 
-# (we will NOT install custom attention processors; stick to built-ins)
 try:
     from diffusers.models.attention_processor import AttnProcessor2_0, XFormersAttnProcessor
     _HAS_ATTENTION_PROCESSORS = True
@@ -221,7 +220,8 @@ class PairListDataset(Dataset):
 # ------------------------------------------------------------
 @torch.no_grad()
 def to_latent_sd3(vae, x_bchw: torch.Tensor) -> torch.Tensor:
-    posterior = vae.encode(x_bchw).latent_dist
+    vdtype = next(vae.parameters()).dtype
+    posterior = vae.encode(x_bchw.to(vdtype)).latent_dist
     latents = posterior.sample()
     sf = vae.config.scaling_factor
     sh = getattr(vae.config, "shift_factor", 0.0)
@@ -231,6 +231,8 @@ def to_latent_sd3(vae, x_bchw: torch.Tensor) -> torch.Tensor:
 
 @torch.no_grad()
 def from_latent_sd3(vae, z: torch.Tensor) -> torch.Tensor:
+    vdtype = next(vae.parameters()).dtype
+    z = z.to(vdtype)
     sf = vae.config.scaling_factor
     sh = getattr(vae.config, "shift_factor", 0.0)
     z = z / sf + sh
@@ -239,7 +241,7 @@ def from_latent_sd3(vae, z: torch.Tensor) -> torch.Tensor:
 
 
 class ConcatProjector(nn.Module):
-    # default in_ch kept as 33 for backward compat, but we pass 17 in ctor
+    # 16 (z) + 16 (Xi) + 1 (mask) = 33 -> 16
     def __init__(self, in_ch=33, out_ch=16):
         super().__init__()
         self.net = nn.Sequential(
@@ -290,12 +292,6 @@ def freeze_all_but_self_attn_qkv(transformer: SD3Transformer2DModel):
 
 def apply_attention_backend(transformer: SD3Transformer2DModel, logger: logging.Logger,
                             prefer_xformers: bool = True) -> str:
-    """
-    Keep things simple & stable:
-      - Prefer built-in xFormers memory-efficient attention (no custom wrappers).
-      - Else fall back to default SDPA/attn.
-    Cross-attn is effectively disabled by feeding zero text embeddings elsewhere.
-    """
     try:
         if prefer_xformers:
             transformer.enable_xformers_memory_efficient_attention()
@@ -424,9 +420,10 @@ class CatVTON_SD3_Trainer:
         if self.is_main:
             self.logger.info(f"[mem] attention_backend={attn_mode}")
 
-        # projector: keep FP32
-        self.projector = ConcatProjector(in_ch=17, out_ch=16).to(self.device, dtype=torch.float32)
+        # projector: keep FP32 — 33ch 입력
+        self.projector = ConcatProjector(in_ch=33, out_ch=16).to(self.device, dtype=torch.float32)
         self.adapter_alpha = float(getattr(cfg, "adapter_alpha", 1.0))
+
         self.start_epoch = 0
         self.start_step = 0
         self._loaded_ckpt_optimizer = None
@@ -479,6 +476,7 @@ class CatVTON_SD3_Trainer:
             num_workers=cfg.num_workers, pin_memory=True, drop_last=True
         )
         self.logger.info(f"Dataset len={len(self.dataset)} batch_size(per-rank)={cfg.batch_size} invert_mask={cfg.invert_mask}")
+        self.logger.info("Mask semantics: Mi=1 KEEP, Mi=0 HOLE")
 
         if self.is_dist:
             self.steps_per_epoch = max(1, self.sampler.num_samples // cfg.batch_size)
@@ -505,6 +503,11 @@ class CatVTON_SD3_Trainer:
             self.projector, device_ids=[self.local_rank], output_device=self.local_rank,
             broadcast_buffers=False, find_unused_parameters=False
         )
+        if isinstance(self.projector, DDP):
+            self.projector.module.to(dtype=torch.float32)
+        else:
+            self.projector.to(dtype=torch.float32)
+
         if self.is_main:
             _debug_print_trainables(self.transformer.module, "after_ddp")
 
@@ -602,7 +605,7 @@ class CatVTON_SD3_Trainer:
 
     @torch.no_grad()
     def _preview_sample(self, batch: Dict[str, torch.Tensor], num_steps: int) -> torch.Tensor:
-        """Img2img-style preview: start from add_noise(Xi, t_start) and denoise only tail."""
+        """Img2img-style preview with per-step recomposition for hard preservation."""
         H, W = self.cfg.size_h, self.cfg.size_w
         x_in = batch["x_concat_in"].to(self.device, self.dtype)
         m    = batch["m_concat"].to(self.device, self.dtype)
@@ -636,34 +639,29 @@ class CatVTON_SD3_Trainer:
 
         prompt_embeds, pooled = self._encode_prompts(B)
 
-        # mask gate
-        w2 = Mi.shape[-1] // 2
-        gate = torch.zeros_like(Mi)
-        gate[:, :, :, :w2] = (1.0 - Mi[:, :, :, :w2]).float()   # 왼쪽 hole만 1
-
-        # optional norm matching scale
-        def norm_match_scale(a: torch.Tensor, b: torch.Tensor, clip: float) -> torch.Tensor:
-            eps = 1e-6
-            s = (a.flatten(1).norm(dim=1, keepdim=True) /
-                 (b.flatten(1).norm(dim=1, keepdim=True) + eps)).view(B, 1, 1, 1)
-            return s.clamp(0.0, clip)
-
-        for t in timesteps:
+        for i, t in enumerate(timesteps):
             t1d = self._as_1d_timesteps(z, t, B, self.scheduler)
             z_in = self._scale_model_input_safe(z, t1d, self.scheduler)
 
-            cm = torch.cat([Xi.float(), Mi.float()], dim=1)                     # [B,17,h,w]
-            cm = torch.nan_to_num(cm, nan=0.0, posinf=30.0, neginf=-30.0).clamp_(-30.0, 30.0)
+            # 33ch concat → projector(33→16) → (z_in + α·proj)
+            hidden_cat = torch.cat([z_in.float(), Xi.float(), Mi.float()], dim=1)
+            hidden_cat = torch.nan_to_num(hidden_cat, nan=0.0, posinf=30.0, neginf=-30.0).clamp_(-30.0, 30.0)
+            with torch.amp.autocast(device_type='cuda', enabled=False):
+                proj = (self.projector.module(hidden_cat.float()) if isinstance(self.projector, DDP)
+                        else self.projector(hidden_cat.float()))
+            proj = proj.float()
 
-            adapt = (self.projector.module(cm) if isinstance(self.projector, DDP) else self.projector(cm))  # fp32
-            adapt = adapt * gate  # gate to mask region only
+            # projector only on HOLE
+            proj = proj * (1.0 - Mi.float())
 
+            # norm match (optional)
             if self.cfg.norm_match_adapter:
-                sclip = float(self.cfg.norm_match_clip)
-                scale = norm_match_scale(z_in.float(), adapt, sclip)
-                adapt = adapt * scale
+                eps = 1e-6
+                s = (z_in.float().flatten(1).norm(dim=1, keepdim=True) /
+                    (proj.flatten(1).norm(dim=1, keepdim=True) + eps)).view(B,1,1,1)
+                proj = proj * s.clamp(0.0, float(self.cfg.norm_match_clip))
 
-            hidden_in = (z_in.float() + self.adapter_alpha * adapt).to(self.dtype)
+            hidden_in = (z_in.float() + self.adapter_alpha * proj).to(self.dtype)
 
             with torch.amp.autocast(device_type='cuda', dtype=self.dtype, enabled=(self.device.type == 'cuda')):
                 model = self.transformer.module if isinstance(self.transformer, DDP) else self.transformer
@@ -676,6 +674,26 @@ class CatVTON_SD3_Trainer:
                 ).sample
 
             z = self.scheduler.step(v, t, z).prev_sample
+            z = z.to(self.dtype)
+
+            # Per-step recomposition (hard preservation): keep (Mi==1) ← Xi with same noise at t_next
+            if i < (len(timesteps) - 1):
+                t_next = timesteps[i + 1]
+            else:
+                t_next = torch.tensor(0, device=self.device, dtype=timesteps.dtype)
+
+            try:
+                z_keep = self.scheduler.add_noise(Xi.float(), noise, t_next).to(self.dtype)
+            except Exception:
+                if hasattr(self.scheduler, "sigmas"):
+                    idx_next = min(i + 1, len(self.scheduler.sigmas) - 1)
+                    sigma = self.scheduler.sigmas[idx_next].to(self.device)
+                else:
+                    sigma = torch.tensor(float(getattr(self.scheduler, "init_noise_sigma", 1.0)),
+                                         device=self.device, dtype=torch.float32)
+                z_keep = (Xi.float() + noise * sigma).to(self.dtype)
+
+            z = Mi.float() * z_keep + (1.0 - Mi.float()) * z
 
         x_hat = from_latent_sd3(self.vae, z)
         return torch.clamp((x_hat + 1.0) * 0.5, 0.0, 1.0)
@@ -691,6 +709,7 @@ class CatVTON_SD3_Trainer:
         pred_img = self._preview_sample(
             {k: v[:max_rows] for k, v in batch.items()}, num_steps=self.cfg.preview_infer_steps
         )
+        pred_img = pred_img.to(x_in.dtype)
 
         B, C, H, WW = x_gt.shape
         W = WW // 2
@@ -715,7 +734,7 @@ class CatVTON_SD3_Trainer:
             row = torch.cat(tiles, dim=2)
             rows.append(row)
         panel = torch.stack(rows, dim=0)
-        grid = make_grid(panel, nrow=1)
+        grid = make_grid(panel.to(dtype=torch.float32), nrow=1).cpu()
         out_path = os.path.join(self.img_dir, f"step_{global_step:06d}.png")
         save_image(grid, out_path)
         self.logger.info(f"[img] saved preview at step {global_step}: {out_path}")
@@ -739,17 +758,21 @@ class CatVTON_SD3_Trainer:
             Xi = Xi * (1.0 - drop)
             Mi = Mi * (1.0 - drop)
 
-        # ---- Use TRAIN scheduler for t/noise/target ----
+        # ---- TRAIN scheduler for t/noise/target ----
         timesteps = torch.randint(
             0, self.train_scheduler.config.num_train_timesteps, (B,),
             device=self.device, dtype=torch.long
         )
 
-        # --------- Build noisy & target ---------
-        z0_f32     = z0.float()
-        noise_f32  = torch.randn_like(z0_f32)
-        noisy_f32  = self.train_scheduler.add_noise(original_samples=z0_f32, noise=noise_f32, timesteps=timesteps)
-        noisy_f32  = torch.nan_to_num(noisy_f32, nan=0.0, posinf=1e4, neginf=-1e4)
+        # --------- inpainting forward: noisy samples & target(v-pred) ---------
+        z0_f32     = z0.float()                           # [B,16,h,w]
+        Xi_f32     = Xi.float()                           # [B,16,h,w]
+        noise_f32  = torch.randn_like(z0_f32)             # [B,16,h,w]
+        z0_noisy   = self.train_scheduler.add_noise(z0_f32, noise_f32, timesteps)
+        Xi_noisy   = self.train_scheduler.add_noise(Xi_f32, noise_f32, timesteps)
+
+        # x_t = Mi*Xi_noisy + (1−Mi)*z0_noisy
+        x_t_mixed  = Mi.float() * Xi_noisy + (1.0 - Mi.float()) * z0_noisy     # [B,16,h,w]
 
         pred_type = getattr(self.train_scheduler.config, "prediction_type", "v_prediction")
         if pred_type == "epsilon":
@@ -759,27 +782,28 @@ class CatVTON_SD3_Trainer:
         else:
             raise ValueError(f"Unsupported prediction_type: {pred_type}")
 
-        # --------- Preconditioning: scale z_t ONLY ---------
-        scaled_noisy_f32 = self._scale_model_input_safe(noisy_f32, timesteps, self.train_scheduler)
+        # --------- Preconditioning: scale x_t ONLY ---------
+        z_in = self._scale_model_input_safe(x_t_mixed, timesteps, self.train_scheduler)
 
-        # --------- Adapter (mask-gated + optional norm-match) ---------
-        cm_f32 = torch.cat([Xi.float(), Mi.float()], dim=1)                                # [B,17,h,w]
-        cm_f32 = torch.nan_to_num(cm_f32, nan=0.0, posinf=30.0, neginf=-30.0).clamp_(-30.0, 30.0)
-        adapt_f32 = (self.projector.module(cm_f32) if isinstance(self.projector, DDP) else self.projector(cm_f32))  # [B,16,h,w]
+        # 33ch concat: [...] → projector(33→16) → (z_in + α·proj) → transformer
+        hidden_cat_f32 = torch.cat([z_in.float(), Xi.float(), Mi.float()], dim=1)  # [B,33,h,w]
+        hidden_cat_f32 = torch.nan_to_num(hidden_cat_f32, nan=0.0, posinf=30.0, neginf=-30.0).clamp_(-30.0, 30.0)
+        with torch.amp.autocast(device_type='cuda', enabled=False):
+            proj_f32 = (self.projector.module(hidden_cat_f32.float()) if isinstance(self.projector, DDP)
+                        else self.projector(hidden_cat_f32.float()))
+        proj_f32 = proj_f32.float()
 
-        w2 = Mi.shape[-1] // 2
-        gate = torch.zeros_like(Mi)
-        gate[:, :, :, :w2] = (1.0 - Mi[:, :, :, :w2]).float()   # 왼쪽 hole만 1
-        adapt_f32 = adapt_f32 * gate
+        # projector only on HOLE
+        proj_f32 = proj_f32 * (1.0 - Mi.float())
 
+        # norm match (optional)
         if self.cfg.norm_match_adapter:
             eps = 1e-6
-            s = (scaled_noisy_f32.flatten(1).norm(dim=1, keepdim=True) /
-                 (adapt_f32.flatten(1).norm(dim=1, keepdim=True) + eps)).view(B, 1, 1, 1)
-            s = s.clamp(0.0, float(self.cfg.norm_match_clip))
-            adapt_f32 = adapt_f32 * s
+            s = (z_in.float().flatten(1).norm(dim=1, keepdim=True) /
+                (proj_f32.flatten(1).norm(dim=1, keepdim=True) + eps)).view(B,1,1,1)
+            proj_f32 = proj_f32 * s.clamp(0.0, float(self.cfg.norm_match_clip))
 
-        hidden_in = (scaled_noisy_f32 + self.adapter_alpha * adapt_f32).to(self.dtype)
+        hidden_in = (z_in.float() + self.adapter_alpha * proj_f32).to(self.dtype)
 
         prompt_embeds, pooled_prompt_embeds = self._encode_prompts(B)
 
@@ -795,15 +819,26 @@ class CatVTON_SD3_Trainer:
 
         out_f32 = out.float()
 
-        # --------- Loss (emphasize HOLE on left/try-on half) ---------
-        h, w = out_f32.shape[-2], out_f32.shape[-1]
-        wmap = torch.ones((B, 1, h, w), device=out_f32.device, dtype=out_f32.dtype)
+        # --------- Loss: hole-weighted + (optional) keep consistency on pred_x0 ---------
+        hole = (1.0 - Mi.float())                                # [B,1,h,w]
+        wmap = 1.0 + float(self.cfg.hole_loss_weight) * hole     # weight only on HOLE
+        loss_main = torch.mean(((out_f32 - target_f32) ** 2) * wmap)
 
-        left_keep = (Mi[:, :, :, :w//2] > 0).float()  # keep=1, hole=0
-        left_hole = 1.0 - left_keep                   # hole=1
-        wmap[:, :, :, :w//2] = 1.0 + float(self.cfg.hole_loss_weight) * left_hole
+        loss = loss_main
+        if getattr(self.cfg, "keep_consistency_lambda", 0.0) > 0.0:
+            # pred_x0 from v-pred: x0 = alpha * x_t - sigma * v  where a_bar = prod(alpha_t^2)
+            ac = self.train_scheduler.alphas_cumprod
+            if not torch.is_tensor(ac):
+                ac = torch.tensor(ac, device=self.device, dtype=torch.float32)
+            else:
+                ac = ac.to(self.device, dtype=torch.float32)
+            a_bar = ac[timesteps].view(B,1,1,1)
+            alpha = torch.sqrt(a_bar)
+            sigma = torch.sqrt(1.0 - a_bar)
 
-        loss = torch.mean(((out_f32 - target_f32) ** 2) * wmap)
+            pred_x0 = alpha * x_t_mixed.float() - sigma * out_f32
+            loss_keep = torch.mean(((pred_x0 - z0_f32) ** 2) * Mi.float())
+            loss = loss + float(self.cfg.keep_consistency_lambda) * loss_keep
 
         if not torch.isfinite(loss) or not loss.requires_grad:
             return None
@@ -835,7 +870,7 @@ class CatVTON_SD3_Trainer:
     def _resume_from_ckpt_if_needed(self, resume_path: Optional[str]):
         self.start_epoch = 0
         self.start_step = 0
-        self._loaded_ckpt_optimizer = None  # optimizer는 DDP/optimizer 생성 후 로드
+        self._loaded_ckpt_optimizer = None
 
         if not resume_path or not os.path.isfile(resume_path):
             return
@@ -869,7 +904,7 @@ class CatVTON_SD3_Trainer:
         epoch = getattr(self, "start_epoch", 0)
         self.transformer.train()
         self.projector.train()
-        self.scaler = torch_amp.GradScaler('cuda') if self.use_scaler else None
+        self.scaler = torch_amp.GradScaler(enabled=self.use_scaler)
 
         if self._loaded_ckpt_scaler is not None and self.use_scaler:
             self.scaler.load_state_dict(self._loaded_ckpt_scaler)
@@ -1020,7 +1055,7 @@ DEFAULTS = {
     "use_scaler": True,
 
     "prefer_xformers": True,
-    "strip_cross_attention": True,  # kept for backward-compat (handled via zero-text)
+    "strip_cross_attention": True,
     "disable_text": True,
 
     "save_root_dir": "logs", "save_name": "catvton_sd35",
@@ -1030,13 +1065,13 @@ DEFAULTS = {
     "resume_ckpt": None,
 
     "preview_infer_steps": 16,
-    "preview_strength": 0.6,     # NEW: img2img start amount for preview
-    "preview_seed": 1234,
+    "preview_strength": 0.6,
 
-    "hole_loss_weight": 2.0,     # NEW: weight for hole region on left half
-    "norm_match_adapter": True,  # NEW: scale adapter to z_t norm
-    "norm_match_clip": 5.0,      # NEW: clamp for norm scale
+    "hole_loss_weight": 2.0,
+    "norm_match_adapter": True,
+    "norm_match_clip": 5.0,
 
+    "keep_consistency_lambda": 0.0,   # optional identity term on Mi (0 to disable)
     "hf_token": None,
 }
 
@@ -1078,10 +1113,13 @@ def parse_args():
     p.add_argument("--preview_seed", type=int, default=None)
     p.add_argument("--resume_ckpt", type=str, default=None, help="path to checkpoint to resume from")
 
-    # NEW knobs
+    # kept for compat
     p.add_argument("--hole_loss_weight", type=float, default=None)
     p.add_argument("--no_norm_match_adapter", action="store_true")
     p.add_argument("--norm_match_clip", type=float, default=None)
+
+    # new
+    p.add_argument("--keep_consistency_lambda", type=float, default=None)
 
     return p.parse_args()
 
@@ -1115,7 +1153,6 @@ def load_merge_config(args: argparse.Namespace) -> DotDict:
     elif getattr(args, "prefer_xformers", False):
         cfg["prefer_xformers"] = True
 
-    # keep flag for compatibility; actual cross disabling is via zero-text
     if getattr(args, "keep_cross_attention", False):
         cfg["strip_cross_attention"] = False
     elif getattr(args, "strip_cross_attention", False):
@@ -1128,9 +1165,6 @@ def load_merge_config(args: argparse.Namespace) -> DotDict:
 
     if getattr(args, "no_norm_match_adapter", False):
         cfg["norm_match_adapter"] = False
-
-    if not cfg.get("list_file"):
-        raise ValueError("`list_file` must be provided (YAML or CLI).")
 
     return DotDict(cfg)
 
