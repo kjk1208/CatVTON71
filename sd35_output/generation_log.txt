@@ -1,0 +1,14 @@
+SD 3.5 Large Generation Results
+========================================
+Prompt A: a beautiful sunset over mountains
+Prompt B: a peaceful lake at dawn
+Resolution: 1024x1024
+Steps: 28
+Seed: 1234
+Guidance Scale: 7.0
+Negative Prompt: worst quality, low quality, blurry, lowres, artifacts, watermark, text
+Refine Enabled: False
+
+Metrics:
+L1 Difference: 0.316406
+MSE Difference: 0.147461

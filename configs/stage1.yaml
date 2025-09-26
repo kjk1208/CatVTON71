@@ -4,28 +4,41 @@ sd3_model: stabilityai/stable-diffusion-3.5-large
 size_h: 512
 size_w: 384
 
-mask_based: true           # Stage-1: true, Stage-2: false
-invert_mask: true          # 의류 마스크를 뒤집어 Mi: keep=1 / hole=0 로 맞춤
+mask_based: true
+invert_mask: false
 
 # training
 use_scaler: true
 disable_text: true
-lr: 1.0e-4
-batch_size: 64
+lr: 1.0e-4                      # transformer (살짝 상향)
+proj_lr: 5.0e-4                 # projector 전용 (조금 더 공격적)
+batch_size: 5                   # server 20250910
 grad_accum: 1
 max_steps: 256000
 cond_dropout_p: 0.1
-mixed_precision: bf16      # H100이면 bf16
+mixed_precision: fp16
 seed: 1337
 num_workers: 8
 
+
+# inpainting objective
+latent_rec_lambda: 0.15           # 마스크 평균 정규화 후엔 0.1~0.2로 시작 권장
+latent_rec_lambda_warmup_steps: 4000
+loss_sigma_weight: true
+
 # preview
-preview_infer_steps: 32
+preview_infer_steps: 60
 preview_seed: 1234
-preview_strength: 0.6
+preview_strength: 0.4
+preview_alpha_sweep: [0.0, 0.5, 1.0, 2.0]
+preview_use_inpaint_start: true    # 학습 조건과 동일 시작의 프리뷰도 저장
+preview_offload_cpu: false
+preview_rows : 4
+preview_save_raw: false
+preview_save_base : true
 
 # checkpoints & logging
-save_epoch_ckpt: 15
+save_epoch_ckpt: 25            #server
 default_resume_ckpt: None
 resume_ckpt: None
 save_root_dir: logs
@@ -35,13 +48,28 @@ image_every: 200
 save_every: 12800
 
 # adapter / projector
-adapter_alpha: 1.0
+adapter_alpha: 0.5
 norm_match_adapter: true
-norm_match_clip: 5.0
+norm_match_clip: 10.0
+proj_hole_gate_warmup_steps: 4000  # projector HOLE 게이팅 워밍업
+alpha_warmup_steps: 4000
+cond_dropout_warmup_steps: 4000   # 워밍업 늘림
 
-# losses
-hole_loss_weight: 2.0
-keep_consistency_lambda: 0.1   # 0.05~0.2 권장 (0이면 비활성)
+# train phase
+proj_first_steps: 4000
+
+# delete
+hole_only_warmup_steps: 0         # hole-only를 안써서 0으로 설정해서 아에 안쓰게 함 20250910
+hole_loss_weight: 0               # ε MSE의 홀 가중은 이제 원래 hole만 보기 때문에 0으로 설정함 20250910
+keep_consistency_lambda: 0.0       # 왼쪽 전체 생성과 충돌 가능성 → 일단 끄고 시작
+garment_rec_lambda: 0.0           # 오른쪽(의류)도 원본과 동일하게 나오도록 강한 재구성 항
+
+#projector loss
+proj_out_l2_lambda: 5e-4   # projector 출력 에너지 규제(권장: 1e-4 ~ 5e-4)
+proj_margin_lambda: 0.0    # 켜면 transformer 1회 추가 호출 생김
+proj_margin: 0.0
+alpha_proj_only_start: 0.3            # 아래 2번에서 설명
+alpha_proj_only_warmup_steps: 300
 
 # runtime
 hf_token: "${HUGGINGFACE_TOKEN}"

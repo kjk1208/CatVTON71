@@ -1,0 +1,60 @@
+list_file: DATA/VITON-HD/vitonhd_train_mask.csv
+sd3_model: stabilityai/stable-diffusion-3.5-medium
+
+size_h: 512
+size_w: 384
+
+mask_based: true
+invert_mask: true
+disable_text: true
+
+# training
+lr: 5.0e-5
+batch_size: 32
+grad_accum: 1
+max_steps: 256000
+mixed_precision: bf16
+seed: 1337
+num_workers: 8
+
+# inpainting objective
+latent_rec_lambda: 0.5
+latent_rec_lambda_warmup_steps: 1000
+loss_sigma_weight: false
+loss_sigma_weight_warmup_steps: 0
+
+# (optional, 기본값 0이라면 제거 가능)
+# keep_consistency_lambda: 0.0
+# garment_rec_lambda: 0.0
+
+# preview
+preview_infer_steps: 40
+preview_seed: 1234
+preview_strength: 0.10
+preview_rows: 4
+
+# checkpoints & logging
+save_epoch_ckpt: 25
+default_resume_ckpt: null
+resume_ckpt: null
+save_root_dir: logs
+save_name: catvton_sd35_inpaint
+log_every: 10
+image_every: 100
+
+#sigma steps
+train_sched_steps: 1000
+
+# Official SD3 training knobs
+weighting_scheme: logit_normal
+logit_mean: 0.0
+logit_std: 1.0
+mode_scale: 1.29
+precondition_outputs: 1         # match official default
+
+# 고정 프롬프트
+fixed_prompt: None              # None면 기본 문구 사용
+disable_dynamic_shifting: True
+
+# runtime
+hf_token: "${HUGGINGFACE_TOKEN}"
